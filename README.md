@@ -16,7 +16,7 @@ S = sum_i  L_i * f_i * cos_i * w_i
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试
+python -m unittest discover -s tests -v   # 必要测试（自动发现两个测试文件）
 python demo.py                            # 固定输入演示（约 0.1 秒）
 ```
 
@@ -26,6 +26,7 @@ python demo.py                            # 固定输入演示（约 0.1 秒）
 from mis_envlight import (
     Patch, Scene, estimate, direct_sum, proposal_pdfs,
     enumerate_contributions,
+    BatchSpec, BatchedEstimator, estimate_batched,
     ValidationError, DegenerateProposalError, MisEnvLightError,
 )
 ```
@@ -66,6 +67,71 @@ contrib_i = g_i / (n_radiance * p_i + n_cosine * q_i),   g_i = L_i f_i cos_i w_i
 估计量为全部样本贡献之和，其期望恒等于 `S`（测试中用 `fractions.Fraction`
 精确验证该恒等式，并穷举一次抽样的全部组合核对）。
 
+## 分批自适应有限混合采样（本次新增）
+
+每一批从**两个已有策略的有限混合**中抽样，批次 b 的条件分布为
+
+```
+pdf_b(i) = α_b · p_i + (1 − α_b) · q_i
+```
+
+- 每批结束后**允许更新下一批的混合权重** `α_b`（radiance 策略占比）；
+  本库不内置学习规则，权重由调用方按上一批结果自行决定。
+- **正概率下界**：`α_b ∈ [mix_floor, 1 − mix_floor]`，
+  `mix_floor = DEFAULT_MIX_FLOOR = 0.05`（可自定义，必须 `0 < floor < 0.5`）。
+  两个组分策略在每一批都保留严格正权重，不能被关死；`α=0`/`α=1` 被拒绝。
+- **冻结实际抽样时的条件 PDF**：每条样本记录生成它那一批的 `pdf_b(i)`
+  （以及 `α_b`、两策略 pdf），最终估计只读取这些冻结值，**绝不用最终
+  分布回算旧样本的 pdf**。
+- N 个样本的无偏估计为
+
+```
+S_hat = (1/N) · Σ_samples g_i / pdf_b(i)
+```
+
+  给定抽样历史（从而 `α_b` 已固定）时每条样本的条件期望为 `S`，因此
+  自适应改权重不破坏无偏性；测试用 `Fraction` 对"两批分布不同"精确验证。
+
+### 入口
+
+- 一次性：`estimate_batched(scene, f, batches, seed, mix_floor=0.05)`
+  - `batches`：非空序列，每项为 `(n_samples, alpha)` 或 `BatchSpec`；
+    所有规格**先整体校验再抽样**，非法计划在第一条随机数之前抛错。
+  - 返回 `BatchedEstimateResult`。
+- 有状态（批间反馈循环）：
+
+```python
+runner = BatchedEstimator(scene, f, seed=1)
+b0 = runner.run_batch(256, 0.5)          # 第一批
+a1 = rule_from(b0.records)               # 调用方自定，受下界约束
+runner.run_batch(256, a1)                # 分布变化的第二批
+result = runner.result()
+```
+
+  失败的 `run_batch` 在改动任何状态、消耗任何随机数之前完成校验，
+  因此被拒批次**不留半更新状态**，也不扰动可复现的随机流（续跑结果与
+  一路合法的 runner 完全一致，有直接测试）。
+
+### 返回结构
+
+- `BatchSpec(n_samples, alpha)`：批次计划（frozen dataclass）。
+- `BatchSampleRecord`：逐样本 `batch_index`、`draw`、`patch_index`、
+  `alpha`、`pdf_radiance`、`pdf_cosine`、**`pdf_mixture`（冻结的条件 pdf）**、
+  `target_value`、`contribution = g_i / pdf_mixture`。
+- `BatchResult` / `BatchSummary`：`batch_index`、`n_samples`、`alpha`、
+  整批冻结 `pdf`、`contribution_sum`、`mean`。
+- `BatchedEstimateResult`：`estimate`、`variance`（全局均值的分层方差，
+  任一批仅 1 个样本时为 `None`）、`stddev`、`exact`、`total_samples`、
+  `n_batches`、`mix_floor`、`records`、`batches`、`diagnostics`；
+  `result.explain(limit=None)` 输出含批次/α/冻结 pdf 的逐样本解释。
+
+### 单组分零质量
+
+某组分总质量为 0 时（零能量场景的 radiance，或全掠射场景的 cosine），
+该组分不承载权重，混合在**仍有定义的组分上重新归一化**（此时 pdf 与 α
+无关），并发 `ZERO_MASS_COMPONENT` 诊断；两组分都为零（暗且全掠射）
+则构造时抛 `DegenerateProposalError`。
+
 ## 错误语义
 
 - 数值输入拒绝 `NaN` / `±Infinity`；整数参数（样本数、种子）拒绝
@@ -87,6 +153,12 @@ contrib_i = g_i / (n_radiance * p_i + n_cosine * q_i),   g_i = L_i f_i cos_i w_i
 - `VARIANCE_NOT_ESTIMABLE`：某活跃策略恰好 1 个样本，其方差贡献不可
   估计，此时 `variance`/`stddev` 为 `None`。
 - `UNUSED_ZERO_MASS_STRATEGY`：未使用的策略总质量为零（信息性）。
+- `ZERO_MASS_COMPONENT`（分批混合）：某组分策略总质量为零，混合已在
+  另一组分上重归一化，`α` 此时不起作用（信息性）。
+
+分批模式下 `ZERO_PDF_TERM` 针对的是**各批冻结的混合 pdf**：某小片在某
+几批 pdf 为 0 但非每批都为 0 时仅提示；`UNREACHABLE_TERM` 表示该小片
+在**每一批的冻结 pdf 下都为 0** 且目标项非零——有偏。
 
 ## 误差口径（浮点）
 
@@ -106,6 +178,9 @@ contrib_i = g_i / (n_radiance * p_i + n_cosine * q_i),   g_i = L_i f_i cos_i w_i
 - 方差按策略分层估计：`var = Σ_s n_s · s_s²`（`s_s²` 为该策略样本贡献
   的无偏样本方差）；任一活跃策略只有 1 个样本时整体报告 `None`，
   不给出虚假精度。
+- 分批模式的方差按批分层估计全局均值：
+  `var = (1/N²) · Σ_b n_b · s_b²`（各批用其**冻结 pdf** 下的贡献）；
+  任一批只有 1 个样本时整体报告 `None`。
 - 失败即抛异常与诊断列表分离：致命契约违例（非法输入、退化提议）
   抛异常；采样可继续的异常结构（零概率项等）进入 `diagnostics`。
 
@@ -114,5 +189,8 @@ contrib_i = g_i / (n_radiance * p_i + n_cosine * q_i),   g_i = L_i f_i cos_i w_i
 - 仅上半球（`z >= 0`），`cos` 取方向 z 分量，不支持自定义法线。
 - `L`、`f` 均要求非负；负值被积函数不在本契约内。
 - 小片数上限 64；无分层/低差异序列等更高级采样；方差在单样本
-  策略下不可估计（报 `None`）。
+  策略/批次下不可估计（报 `None`）。
+- 分批混合只允许**已有的两个策略**作为组分（有限混合），不新增策略、
+  不内置权重学习规则；`mix_floor` 固定两组分的正概率下界，
+  不支持把任一组分权重降到 0。
 - 只实现本题契约的数学子集，不宣称兼容任何渲染工业标准。

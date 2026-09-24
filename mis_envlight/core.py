@@ -36,12 +36,14 @@ from typing import Sequence
 __all__ = [
     "MAX_PATCHES",
     "NORM_TOLERANCE",
+    "DEFAULT_MIX_FLOOR",
     "STRATEGY_RADIANCE",
     "STRATEGY_COSINE",
     "DIAG_ZERO_PDF_TERM",
     "DIAG_UNREACHABLE_TERM",
     "DIAG_VARIANCE_NOT_ESTIMABLE",
     "DIAG_UNUSED_ZERO_MASS_STRATEGY",
+    "DIAG_ZERO_MASS_COMPONENT",
     "MisEnvLightError",
     "ValidationError",
     "DegenerateProposalError",
@@ -51,10 +53,17 @@ __all__ = [
     "SampleRecord",
     "EstimateResult",
     "ContributionTable",
+    "BatchSpec",
+    "BatchSampleRecord",
+    "BatchResult",
+    "BatchSummary",
+    "BatchedEstimateResult",
+    "BatchedEstimator",
     "direct_sum",
     "proposal_pdfs",
     "enumerate_contributions",
     "estimate",
+    "estimate_batched",
 ]
 
 #: Maximum number of patches in a scene (interface bound from the task).
@@ -62,6 +71,11 @@ MAX_PATCHES = 64
 
 #: Tolerance on |direction| - 1 when validating unit directions.
 NORM_TOLERANCE = 1e-9
+
+#: Default lower bound on every mixture component: each batch must use a
+#: radiance fraction alpha in [DEFAULT_MIX_FLOOR, 1 - DEFAULT_MIX_FLOOR],
+#: so neither existing strategy is ever assigned zero probability.
+DEFAULT_MIX_FLOOR = 0.05
 
 STRATEGY_RADIANCE = "radiance"
 STRATEGY_COSINE = "cosine"
@@ -71,6 +85,7 @@ DIAG_ZERO_PDF_TERM = "ZERO_PDF_TERM"
 DIAG_UNREACHABLE_TERM = "UNREACHABLE_TERM"
 DIAG_VARIANCE_NOT_ESTIMABLE = "VARIANCE_NOT_ESTIMABLE"
 DIAG_UNUSED_ZERO_MASS_STRATEGY = "UNUSED_ZERO_MASS_STRATEGY"
+DIAG_ZERO_MASS_COMPONENT = "ZERO_MASS_COMPONENT"
 
 
 # ---------------------------------------------------------------------------
@@ -541,3 +556,417 @@ def enumerate_contributions(scene, f, n_radiance, n_cosine):
         radiance=row(pdf_radiance) if n_radiance > 0 else None,
         cosine=row(pdf_cosine) if n_cosine > 0 else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Batched adaptive finite-mixture sampling
+# ---------------------------------------------------------------------------
+#
+# Each batch draws from a *finite mixture* of the two existing proposals:
+#
+#     pdf_b(i) = alpha_b * p_i + (1 - alpha_b) * q_i
+#
+# where alpha_b is chosen per batch (it may change after every finished
+# batch) and is constrained to  mix_floor <= alpha_b <= 1 - mix_floor, so
+# neither component strategy is ever assigned zero probability.
+#
+# A draw from batch b contributes  g_i / pdf_b(i).  The pdf actually used
+# (and alpha) are frozen onto the sample record at draw time; the final
+# estimate only ever reads those frozen values. It must never recompute an
+# old sample's pdf from a later batch's mixture.
+#
+# With N total draws the unbiased estimator is
+#
+#     S_hat = (1/N) * sum_samples g_i / pdf_b(i)
+#
+# Conditional on the sampling history (which fixes alpha_b), each draw has
+# expectation S, hence the estimator is unbiased also under adaptive alphas.
+
+@dataclass(frozen=True)
+class BatchSpec:
+    """One planned batch: n_samples draws from mixture weight alpha.
+
+    alpha is the radiance-strategy fraction; cosine gets (1 - alpha).
+    """
+    n_samples: int
+    alpha: float
+
+
+@dataclass(frozen=True)
+class BatchSampleRecord:
+    """One draw, with the conditional mixture pdf frozen at draw time.
+
+    pdf_mixture is pdf_b(patch_index) for the batch this draw belonged to;
+    contribution = target_value / pdf_mixture. Later batches that change
+    alpha never mutate these fields.
+    """
+    batch_index: int
+    draw: int
+    patch_index: int
+    alpha: float
+    pdf_radiance: float
+    pdf_cosine: float
+    pdf_mixture: float
+    target_value: float
+    contribution: float
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    """State of one finished batch, including its frozen conditional pdf."""
+    batch_index: int
+    n_samples: int
+    alpha: float
+    pdf: tuple
+    records: tuple
+    contribution_sum: float
+    mean: float
+
+
+@dataclass(frozen=True)
+class BatchSummary:
+    """Per-batch summary carried by a BatchedEstimateResult."""
+    batch_index: int
+    n_samples: int
+    alpha: float
+    pdf: tuple
+    contribution_sum: float
+    mean: float
+
+
+@dataclass(frozen=True)
+class BatchedEstimateResult:
+    """Result of batched adaptive mixture sampling.
+
+    estimate is the average (1/N) * sum of the frozen per-draw terms.
+    variance estimates the variance of that average; it is None when any
+    batch contains exactly one sample, whose within-batch variance is not
+    estimable (see DIAG_VARIANCE_NOT_ESTIMABLE).
+    """
+    estimate: float
+    variance: float | None
+    stddev: float | None
+    exact: float
+    total_samples: int
+    n_batches: int
+    mix_floor: float
+    records: tuple
+    batches: tuple
+    diagnostics: tuple
+
+    def explain(self, limit=None):
+        """Human-readable per-sample explanation with batch information."""
+        records = self.records if limit is None else self.records[:limit]
+        lines = [
+            f"batched estimate={self.estimate!r} exact={self.exact!r} "
+            f"variance={self.variance!r} "
+            f"(batches={self.n_batches}, n={self.total_samples}, "
+            f"mix_floor={self.mix_floor})",
+            "batch  draw  patch  alpha    pdf_rad    pdf_cos    "
+            "pdf_mix     target_g        contribution",
+        ]
+        for r in records:
+            lines.append(
+                f"{r.batch_index:<6} {r.draw:<5} {r.patch_index:<6} "
+                f"{r.alpha:<8.4g} {r.pdf_radiance:<10.4g} "
+                f"{r.pdf_cosine:<10.4g} {r.pdf_mixture:<11.4g} "
+                f"{r.target_value:<15.8g} {r.contribution:<12.8g}")
+        shown = len(records)
+        if shown < len(self.records):
+            lines.append(f"... ({len(self.records) - shown} more samples)")
+        return "\n".join(lines)
+
+
+def _check_mix_floor(mix_floor):
+    if isinstance(mix_floor, bool) or not isinstance(mix_floor, (int, float)):
+        raise ValidationError(
+            "mix_floor: expected a real number, got "
+            f"{type(mix_floor).__name__}")
+    e = float(mix_floor)
+    if math.isnan(e) or math.isinf(e):
+        raise ValidationError(f"mix_floor: must be finite, got {mix_floor!r}")
+    if not e > 0.0:
+        raise ValidationError(
+            f"mix_floor: must be > 0 (a positive probability floor is "
+            f"required), got {e!r}")
+    if e >= 0.5:
+        raise ValidationError(
+            "mix_floor: must be < 0.5, otherwise no feasible mixture "
+            f"weight exists, got {e!r}")
+    return e
+
+
+def _check_alpha(alpha, mix_floor, *, name="alpha"):
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise ValidationError(
+            f"{name}: expected a real mixture weight, got {type(alpha).__name__}")
+    a = float(alpha)
+    if math.isnan(a) or math.isinf(a):
+        raise ValidationError(f"{name}: must be finite, got {alpha!r}")
+    hi = 1.0 - mix_floor
+    if not (mix_floor <= a <= hi):
+        raise ValidationError(
+            f"{name}: mixture weight of the radiance strategy must stay in "
+            f"[{mix_floor}, {hi}] to keep a positive probability floor on "
+            f"both strategies, got {a!r}")
+    return a
+
+
+def _mixture_pdf(alpha, pdf_radiance, pdf_cosine, lum_total, cos_total):
+    """Conditional mixture pdf, renormalized over the live components.
+
+    With both strategies live this is alpha*p + (1-alpha)*q (mass 1). When
+    one component has zero total mass it carries no weight and the *other*
+    component's effective weight is renormalized to 1, so the mixture is a
+    proper distribution regardless of alpha (which is then irrelevant).
+    """
+    w_r = alpha if lum_total > 0.0 else 0.0
+    w_c = (1.0 - alpha) if cos_total > 0.0 else 0.0
+    scale = w_r + w_c  # > 0: the constructor rejects both-zero scenes
+    wr, wc = w_r / scale, w_c / scale
+    return tuple(wr * pr + wc * pc
+                 for pr, pc in zip(pdf_radiance, pdf_cosine))
+
+
+class BatchedEstimator:
+    """Stateful runner: one batch at a time, weights updated between batches.
+
+    Typical use:::
+
+        est = BatchedEstimator(scene, f, seed=1)
+        b0 = est.run_batch(n_samples=16, alpha=0.5)      # explore
+        a1 = choose_next_weight(b0)                      # any user rule
+        est.run_batch(n_samples=16, alpha=a1)            # adapted batch
+        result = est.result()
+
+    A failed run_batch validates everything before touching the state or
+    consuming random numbers, so a rejected batch leaves no partial update
+    and does not perturb the reproducible stream.
+    """
+
+    __slots__ = ("scene", "f", "mix_floor", "g", "pdf_radiance",
+                 "pdf_cosine", "_rng", "_records", "_batches",
+                 "_diagnostics")
+
+    def __init__(self, scene, f, *, seed, mix_floor=DEFAULT_MIX_FLOOR):
+        _check_scene(scene)
+        fv = _validate_f(scene, f)
+        floor = _check_mix_floor(mix_floor)
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValidationError(
+                f"seed: expected an integer, got {type(seed).__name__}")
+        if scene.lum_total == 0.0 and scene.cos_total == 0.0:
+            raise DegenerateProposalError(
+                "both strategies have zero total proposal mass "
+                "(sum(L*w) = 0 and sum(cos*w) = 0); no mixture is defined")
+
+        self.scene = scene
+        self.f = fv
+        self.mix_floor = floor
+        self.g = _target_terms(scene, fv)
+        self.pdf_radiance, self.pdf_cosine = proposal_pdfs(scene)
+        self._rng = random.Random(seed)
+        self._records = []
+        self._batches = []
+        diags = []
+        if scene.lum_total == 0.0:
+            diags.append(Diagnostic(
+                DIAG_ZERO_MASS_COMPONENT,
+                "radiance strategy has zero total mass; the mixture is "
+                "driven by the cosine strategy regardless of alpha"))
+        if scene.cos_total == 0.0:
+            diags.append(Diagnostic(
+                DIAG_ZERO_MASS_COMPONENT,
+                "cosine strategy has zero total mass; the mixture is "
+                "driven by the radiance strategy regardless of alpha"))
+        self._diagnostics = diags
+
+    @property
+    def total_samples(self):
+        return len(self._records)
+
+    @property
+    def n_batches(self):
+        return len(self._batches)
+
+    def run_batch(self, n_samples, alpha):
+        """Draw n_samples from the mixture alpha*p + (1-alpha)*q.
+
+        Validates fully before any state change or random draw, records the
+        frozen conditional pdf on every sample, and returns BatchResult.
+        """
+        n = _check_count("n_samples", n_samples)
+        if n < 1:
+            raise ValidationError(
+                f"n_samples: a batch needs at least 1 sample, got {n}")
+        a = _check_alpha(alpha, self.mix_floor)
+
+        pdf = _mixture_pdf(a, self.pdf_radiance, self.pdf_cosine,
+                           self.scene.lum_total, self.scene.cos_total)
+        cdf = _cdf(pdf)  # total mass is 1: at least one component is valid
+        batch_index = len(self._batches)
+        records = []
+        terms = []
+        for draw in range(n):
+            idx = _draw(cdf, self._rng)
+            pdf_here = pdf[idx]
+            # pdf_here > 0: idx came from cdf, which only spans positive mass.
+            contrib = self.g[idx] / pdf_here
+            records.append(BatchSampleRecord(
+                batch_index=batch_index,
+                draw=draw,
+                patch_index=idx,
+                alpha=a,
+                pdf_radiance=self.pdf_radiance[idx],
+                pdf_cosine=self.pdf_cosine[idx],
+                pdf_mixture=pdf_here,
+                target_value=self.g[idx],
+                contribution=contrib,
+            ))
+            terms.append(contrib)
+
+        batch = BatchResult(
+            batch_index=batch_index,
+            n_samples=n,
+            alpha=a,
+            pdf=pdf,
+            records=tuple(records),
+            contribution_sum=math.fsum(terms),
+            mean=math.fsum(terms) / n,
+        )
+        # Commit only after the whole batch has been computed.
+        self._batches.append(batch)
+        self._records.extend(records)
+        return batch
+
+    def result(self):
+        """Collect all finished batches into a BatchedEstimateResult."""
+        if not self._batches:
+            raise ValidationError(
+                "result: no batches have been run; call run_batch first")
+        return _build_batched_result(
+            g=self.g,
+            mix_floor=self.mix_floor,
+            records=self._records,
+            batches=self._batches,
+            base_diagnostics=self._diagnostics)
+
+
+def _batch_diagnostics(g, batches, base_diagnostics):
+    """Zero-pdf / unreachable findings over the union of frozen batch pdfs.
+
+    A positive target term missed by every batch means bias; a zero-target
+    patch that some batch cannot reach is merely informational.
+    """
+    diags = list(base_diagnostics)
+    n_patches = len(g)
+    for i in range(n_patches):
+        missed = [b.batch_index for b in batches if b.pdf[i] == 0.0]
+        if not missed:
+            continue
+        if len(missed) == len(batches) and g[i] > 0.0:
+            diags.append(Diagnostic(
+                DIAG_UNREACHABLE_TERM,
+                f"patch {i}: target term {g[i]!r} > 0 but the frozen "
+                f"mixture pdf is zero in every batch ({len(missed)}); "
+                f"the estimator cannot see this term and will be biased",
+                i))
+        else:
+            diags.append(Diagnostic(
+                DIAG_ZERO_PDF_TERM,
+                f"patch {i}: zero mixture pdf in batch(es) {missed} "
+                f"(target term {g[i]!r})",
+                i))
+    return diags
+
+
+def _build_batched_result(g, mix_floor, records, batches, base_diagnostics):
+    n_total = len(records)
+    # Estimate straight from the contributions frozen at draw time.
+    est = math.fsum(r.contribution for r in records) / n_total
+
+    diagnostics = _batch_diagnostics(g, batches, base_diagnostics)
+    variance = 0.0
+    for b in batches:
+        xs = [r.contribution for r in b.records]
+        if len(xs) == 1:
+            variance = None
+            diagnostics.append(Diagnostic(
+                DIAG_VARIANCE_NOT_ESTIMABLE,
+                f"batch {b.batch_index} has exactly 1 sample; its "
+                f"within-batch variance is not estimable, so no variance "
+                f"is reported"))
+            break
+        # Stratified variance of the global mean:
+        # Var(mean) = (1/N^2) * sum_b n_b * s_b^2, with s_b^2 the
+        # unbiased within-batch sample variance.
+        variance += len(xs) * _strategy_variance(xs)
+    if variance is not None:
+        variance /= n_total * n_total
+
+    summaries = tuple(
+        BatchSummary(batch_index=b.batch_index, n_samples=b.n_samples,
+                     alpha=b.alpha, pdf=b.pdf,
+                     contribution_sum=b.contribution_sum, mean=b.mean)
+        for b in batches)
+    return BatchedEstimateResult(
+        estimate=est,
+        variance=variance,
+        stddev=math.sqrt(variance) if variance is not None else None,
+        exact=math.fsum(g),
+        total_samples=n_total,
+        n_batches=len(batches),
+        mix_floor=mix_floor,
+        records=tuple(records),
+        batches=summaries,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def _coerce_batch_spec(name, spec, mix_floor):
+    if isinstance(spec, BatchSpec):
+        n, alpha = spec.n_samples, spec.alpha
+    elif isinstance(spec, (str, bytes)) or not isinstance(spec, Sequence):
+        raise ValidationError(
+            f"{name}: expected (n_samples, alpha) or BatchSpec, got "
+            f"{type(spec).__name__}")
+    elif len(spec) != 2:
+        raise ValidationError(
+            f"{name}: expected (n_samples, alpha) with 2 entries, got "
+            f"{len(spec)}")
+    else:
+        n, alpha = spec
+    n = _check_count(f"{name}.n_samples", n)
+    if n < 1:
+        raise ValidationError(
+            f"{name}.n_samples: a batch needs at least 1 sample, got {n}")
+    alpha = _check_alpha(alpha, mix_floor, name=f"{name}.alpha")
+    return BatchSpec(n_samples=n, alpha=alpha)
+
+
+def estimate_batched(scene, f, batches, seed, mix_floor=DEFAULT_MIX_FLOOR):
+    """Run several mixture batches in one call; weights may differ per batch.
+
+    batches: non-empty sequence of (n_samples, alpha) pairs or BatchSpec.
+    All specs are validated up front (before any random number is drawn), so
+    an invalid plan raises without leaving partial state.
+    """
+    _check_scene(scene)
+    fv = _validate_f(scene, f)
+    floor = _check_mix_floor(mix_floor)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValidationError(
+            f"seed: expected an integer, got {type(seed).__name__}")
+    if isinstance(batches, (str, bytes)) or not isinstance(batches, Sequence):
+        raise ValidationError(
+            f"batches: expected a sequence of (n_samples, alpha) specs, got "
+            f"{type(batches).__name__}")
+    if len(batches) == 0:
+        raise ValidationError("batches: at least one batch is required")
+    specs = [_coerce_batch_spec(f"batches[{i}]", b, floor)
+             for i, b in enumerate(batches)]
+
+    runner = BatchedEstimator(scene, fv, seed=seed, mix_floor=floor)
+    for spec in specs:
+        runner.run_batch(spec.n_samples, spec.alpha)
+    return runner.result()
