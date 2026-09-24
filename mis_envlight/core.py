@@ -35,13 +35,17 @@ from typing import Sequence
 
 __all__ = [
     "MAX_PATCHES",
+    "MAX_BATCHES",
     "NORM_TOLERANCE",
+    "MIN_STRATEGY_WEIGHT",
     "STRATEGY_RADIANCE",
     "STRATEGY_COSINE",
     "DIAG_ZERO_PDF_TERM",
     "DIAG_UNREACHABLE_TERM",
     "DIAG_VARIANCE_NOT_ESTIMABLE",
     "DIAG_UNUSED_ZERO_MASS_STRATEGY",
+    "DIAG_WEIGHTS_UPDATED",
+    "DIAG_WEIGHTS_CLAMPED",
     "MisEnvLightError",
     "ValidationError",
     "DegenerateProposalError",
@@ -51,17 +55,30 @@ __all__ = [
     "SampleRecord",
     "EstimateResult",
     "ContributionTable",
+    "BatchRecord",
+    "AdaptiveResult",
     "direct_sum",
     "proposal_pdfs",
     "enumerate_contributions",
     "estimate",
+    "estimate_adaptive",
+    "variance_minimizing_updater",
 ]
 
 #: Maximum number of patches in a scene (interface bound from the task).
 MAX_PATCHES = 64
 
+#: Maximum number of batches in one adaptive run (interface bound).
+MAX_BATCHES = 1024
+
 #: Tolerance on |direction| - 1 when validating unit directions.
 NORM_TOLERANCE = 1e-9
+
+#: Lower bound on every strategy's sampling weight within a batch. Keeps the
+#: per-batch mixture a genuine mix of both existing strategies; neither can
+#: be driven to zero probability between batches. A weight pair is a ratio
+#: (internally normalized); each normalized share must be >= this value.
+MIN_STRATEGY_WEIGHT = 1e-3
 
 STRATEGY_RADIANCE = "radiance"
 STRATEGY_COSINE = "cosine"
@@ -71,6 +88,8 @@ DIAG_ZERO_PDF_TERM = "ZERO_PDF_TERM"
 DIAG_UNREACHABLE_TERM = "UNREACHABLE_TERM"
 DIAG_VARIANCE_NOT_ESTIMABLE = "VARIANCE_NOT_ESTIMABLE"
 DIAG_UNUSED_ZERO_MASS_STRATEGY = "UNUSED_ZERO_MASS_STRATEGY"
+DIAG_WEIGHTS_UPDATED = "WEIGHTS_UPDATED"
+DIAG_WEIGHTS_CLAMPED = "WEIGHTS_CLAMPED"
 
 
 # ---------------------------------------------------------------------------
@@ -340,16 +359,30 @@ class SampleRecord:
     contribution = target_value / (n_radiance*pdf_radiance + n_cosine*pdf_cosine)
     mis_weight   = n_self * pdf_self / (same denominator)   (balance heuristic)
     The estimator is the sum of all records' contributions.
+
+    In an adaptive run every record additionally carries the index of the
+    batch that produced it; the counts/pdfs above are the *conditional* ones
+    in force when that batch was drawn and are frozen here, so later weight
+    updates never recompute an earlier sample's contribution.
     """
     strategy: str
     draw: int
     patch_index: int
     n_self: int
+    n_other: int
     pdf_self: float
     pdf_other: float
     mis_weight: float
     target_value: float
     contribution: float
+    batch: int = 0
+
+    def mixture_pdf(self):
+        """Conditional mixture pdf of one draw, (n_self*pdf_self +
+        n_other*pdf_other) / (n_self + n_other), frozen from sampling time."""
+        total = self.n_self + self.n_other
+        return (self.n_self * self.pdf_self
+                + self.n_other * self.pdf_other) / total
 
 
 @dataclass(frozen=True)
@@ -460,6 +493,8 @@ def estimate(scene, f, n_radiance, n_cosine, seed):
                 draw=draw,
                 patch_index=idx,
                 n_self=count,
+                n_other=(n_cosine if strategy == STRATEGY_RADIANCE
+                         else n_radiance),
                 pdf_self=p_self,
                 pdf_other=p_other,
                 mis_weight=count * p_self / denom,
@@ -541,3 +576,345 @@ def enumerate_contributions(scene, f, n_radiance, n_cosine):
         radiance=row(pdf_radiance) if n_radiance > 0 else None,
         cosine=row(pdf_cosine) if n_cosine > 0 else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-batch adaptive MIS
+# ---------------------------------------------------------------------------
+#
+# A run consists of ``n_batches`` independent batches of ``samples_per_batch``
+# draws. Within one batch the two existing strategies are mixed with fixed
+# counts (n_radiance, n_cosine) and the ordinary balance heuristic, so each
+# batch estimator E_b is unbiased for S on its own. The run estimator is the
+# unweighted mean (1/B) * sum_b E_b, hence unbiased regardless of how the
+# per-batch counts evolve.
+#
+# Between batches the caller may update the *sampling weights* (count split)
+# for the next batch. Every sample is scored with the conditional mixture in
+# force when it was drawn: its SampleRecord freezes that batch's counts and
+# the (unchanging) per-strategy proposal pdfs. Aggregation only ever reads
+# those frozen per-batch values; it never recomputes an old sample with the
+# final weights (doing so would bias the estimator — see the exact-rational
+# regression test).
+
+@dataclass(frozen=True)
+class BatchRecord:
+    """One batch of an adaptive run (frozen at sampling time).
+
+    weight_radiance/weight_cosine are the realized mixture shares, i.e. the
+    actual integer count split (n_self / samples_per_batch). These are the
+    conditional weights used to score this batch's samples; they are never
+    rewritten by later updates.
+    """
+    batch: int
+    samples_per_batch: int
+    n_radiance: int
+    n_cosine: int
+    weight_radiance: float
+    weight_cosine: float
+    estimate: float
+    variance: float | None
+    records: tuple
+
+
+@dataclass(frozen=True)
+class AdaptiveResult:
+    """Result of estimate_adaptive().
+
+    estimate is the unweighted mean of the per-batch estimators. variance is
+    the estimated variance of that mean (batches are sampled independently):
+    (1/B^2) * sum_b Var(E_b). It is None when any active per-batch strategy
+    stratum has a single sample, matching the single-shot convention.
+    """
+    estimate: float
+    variance: float | None
+    stddev: float | None
+    exact: float
+    n_batches: int
+    samples_per_batch: int
+    floor: float
+    initial_weights: tuple
+    final_weights: tuple
+    batch_records: tuple
+    records: tuple
+    diagnostics: tuple
+
+    def explain(self, limit=None):
+        """Human-readable per-batch allocation summary."""
+        lines = [
+            f"estimate={self.estimate!r} exact={self.exact!r} "
+            f"variance={self.variance!r} "
+            f"(batches={self.n_batches}, samples/batch={self.samples_per_batch})",
+            "batch  n_rad  n_cos  w_rad       w_cos       batch_est     batch_var",
+        ]
+        shown = self.batch_records if limit is None else self.batch_records[:limit]
+        for b in shown:
+            lines.append(
+                f"{b.batch:<6} {b.n_radiance:<6} {b.n_cosine:<6} "
+                f"{b.weight_radiance:<11.6g} {b.weight_cosine:<11.6g} "
+                f"{b.estimate:<13.8g} {b.variance!r}")
+        if limit is not None and limit < len(self.batch_records):
+            lines.append(f"... ({len(self.batch_records) - limit} more batches)")
+        return "\n".join(lines)
+
+
+def _check_batch_params(n_batches, samples_per_batch, floor):
+    n_batches = _check_count("n_batches", n_batches)
+    if not 1 <= n_batches <= MAX_BATCHES:
+        raise ValidationError(
+            f"n_batches: must be in [1, {MAX_BATCHES}], got {n_batches}")
+    m = _check_count("samples_per_batch", samples_per_batch)
+    if m < 2:
+        # Both strategies keep positive probability, so each needs >= 1 draw;
+        # 2 is the smallest batch that admits the floor guarantee.
+        raise ValidationError(
+            f"samples_per_batch: must be >= 2 (both strategies stay active), "
+            f"got {m}")
+    fl = _check_real("floor", floor)
+    if not 0.0 < fl <= 0.5:
+        raise ValidationError(
+            f"floor: must be in (0.0, 0.5], got {floor!r}")
+    # The realized counts are integers; each strategy must receive at least
+    # ceil(m*floor) draws for the bound to be realizable.
+    lo = max(1, math.ceil(m * fl - 1e-12))
+    if 2 * lo > m:
+        raise ValidationError(
+            f"floor={fl!r} is not realizable with samples_per_batch={m}: "
+            f"each strategy would need {lo} draws but only {m} are available")
+    return n_batches, m, fl, lo
+
+
+def _check_initial_weights(weights, floor):
+    name = "initial_weights"
+    if isinstance(weights, (str, bytes)) or not isinstance(weights, Sequence):
+        raise ValidationError(
+            f"{name}: expected a pair (w_radiance, w_cosine), "
+            f"got {type(weights).__name__}")
+    if len(weights) != 2:
+        raise ValidationError(f"{name}: expected exactly 2 entries, got {len(weights)}")
+    wr = _check_real(f"{name}[0]", weights[0])
+    wc = _check_real(f"{name}[1]", weights[1])
+    if wr <= 0.0 or wc <= 0.0:
+        raise ValidationError(
+            f"{name}: both weights must be > 0, got ({wr!r}, {wc!r})")
+    s = wr + wc
+    ar, ac = wr / s, wc / s
+    if ar < floor or ac < floor:
+        raise ValidationError(
+            f"{name}: normalized shares ({ar!r}, {ac!r}) violate the "
+            f"positive-probability floor {floor!r}")
+    return ar, ac
+
+
+def _split_counts(m, ar, lo):
+    """Integer count split; each strategy gets at least lo draws."""
+    n_r = int(math.floor(m * ar + 0.5))
+    n_r = min(m - lo, max(lo, n_r))
+    return n_r, m - n_r
+
+
+def _coerce_updated_weights(raw, batch_index, floor):
+    """Validate an updater return, then enforce the floor by clamping.
+
+    Malformed values (wrong type/length, NaN, inf, negative, both zero) are
+    rejected: the failure aborts the whole run before it is returned, so no
+    caller can observe a half-updated run. Out-of-floor but well-formed
+    shares are clamped onto [floor, 1-floor] (the documented positivity
+    guarantee) and surface as a DIAG_WEIGHTS_CLAMPED diagnostic.
+    """
+    name = f"updater return (after batch {batch_index})"
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise ValidationError(
+            f"{name}: expected a pair (w_radiance, w_cosine), "
+            f"got {type(raw).__name__}")
+    if len(raw) != 2:
+        raise ValidationError(f"{name}: expected exactly 2 entries, got {len(raw)}")
+    wr = _check_real(f"{name}[0]", raw[0], minimum=0.0)
+    wc = _check_real(f"{name}[1]", raw[1], minimum=0.0)
+    total = wr + wc
+    if total <= 0.0:
+        raise ValidationError(f"{name}: weights must not both be zero")
+    ar, ac = wr / total, wc / total
+    cr = min(1.0 - floor, max(floor, ar))
+    cc = 1.0 - cr
+    # Clamping actually changes the value iff the radiance share lies
+    # outside [floor, 1-floor]; compare the decision inputs directly rather
+    # than the renormalized floats (1-cr vs ac can differ by round-off even
+    # when nothing was clamped).
+    clamped = ar < floor or ar > 1.0 - floor
+    return (cr, cc), clamped
+
+
+def _run_batch(scene, g, pdf_radiance, pdf_cosine, rng,
+               batch_index, m, ar, lo):
+    """Draw and score one batch with its own frozen conditional mixture."""
+    n_r, n_c = _split_counts(m, ar, lo)
+    records = []
+    per_strategy = {STRATEGY_RADIANCE: [], STRATEGY_COSINE: []}
+    for strategy, count, pdf in (
+            (STRATEGY_RADIANCE, n_r, pdf_radiance),
+            (STRATEGY_COSINE, n_c, pdf_cosine)):
+        cdf = _cdf(pdf)
+        for draw in range(count):
+            idx = _draw(cdf, rng)
+            denom = n_r * pdf_radiance[idx] + n_c * pdf_cosine[idx]
+            contrib = g[idx] / denom
+            p_self = pdf[idx]
+            p_other = (pdf_cosine[idx] if strategy == STRATEGY_RADIANCE
+                       else pdf_radiance[idx])
+            rec = SampleRecord(
+                strategy=strategy,
+                draw=draw,
+                patch_index=idx,
+                n_self=count,
+                n_other=(n_c if strategy == STRATEGY_RADIANCE else n_r),
+                pdf_self=p_self,
+                pdf_other=p_other,
+                mis_weight=count * p_self / denom,
+                target_value=g[idx],
+                contribution=contrib,
+                batch=batch_index,
+            )
+            records.append(rec)
+            per_strategy[strategy].append(contrib)
+    est = math.fsum(r.contribution for r in records)
+    variance = 0.0
+    not_estimable = False
+    for own in per_strategy.values():
+        if len(own) == 1:
+            not_estimable = True
+            break
+        variance += len(own) * _strategy_variance(own)
+    return BatchRecord(
+        batch=batch_index,
+        samples_per_batch=m,
+        n_radiance=n_r,
+        n_cosine=n_c,
+        weight_radiance=n_r / m,
+        weight_cosine=n_c / m,
+        estimate=est,
+        variance=(None if not_estimable else variance),
+        records=tuple(records),
+    )
+
+
+def estimate_adaptive(scene, f, n_batches, samples_per_batch, seed, *,
+                      initial_weights=(0.5, 0.5),
+                      floor=MIN_STRATEGY_WEIGHT,
+                      updater=None):
+    """Multi-batch MIS with weights that may change between batches.
+
+    scene, f:        as in estimate().
+    n_batches:       int in [1, MAX_BATCHES].
+    samples_per_batch: int >= 2; each batch allocates its draws between the
+                     two strategies and every batch keeps both active.
+    seed:            int (bool rejected); same seed reproduces the whole run.
+    initial_weights: positive ratio pair (w_radiance, w_cosine); normalized
+                     internally, each share must be >= floor.
+    floor:           positive-probability lower bound in (0, 0.5]; weights
+                     returned by the updater are clamped onto
+                     [floor, 1-floor] with a DIAG_WEIGHTS_CLAMPED diagnostic.
+    updater:         callable(BatchRecord) -> (w_radiance, w_cosine), invoked
+                     after every batch except the last; None keeps the
+                     distribution fixed. Malformed returns raise
+                     ValidationError and abort the run.
+
+    Both strategies must be non-degenerate for the whole run (the floor keeps
+    both active every batch), so a zero-mass proposal is rejected up front
+    with DegenerateProposalError before any sampling happens.
+    """
+    _check_scene(scene)
+    fv = _validate_f(scene, f)
+    n_batches, m, fl, lo = _check_batch_params(n_batches, samples_per_batch, floor)
+    ar, ac = _check_initial_weights(initial_weights, fl)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValidationError(
+            f"seed: expected an integer, got {type(seed).__name__}")
+    if updater is not None and not callable(updater):
+        raise ValidationError(
+            f"updater: expected a callable or None, got {type(updater).__name__}")
+    # Both strategies are active in every batch by construction, so both
+    # proposal masses must be positive.
+    _check_strategies(scene, 1, 1)
+
+    g = _target_terms(scene, fv)
+    pdf_radiance, pdf_cosine = proposal_pdfs(scene)
+    diagnostics = list(_diagnose(scene, g, pdf_radiance, pdf_cosine, 1, 1))
+
+    rng = random.Random(seed)
+    batch_records = []
+    cur = (ar, ac)
+    for b in range(n_batches):
+        brec = _run_batch(scene, g, pdf_radiance, pdf_cosine, rng,
+                          b, m, cur[0], lo)
+        if brec.variance is None:
+            diagnostics.append(Diagnostic(
+                DIAG_VARIANCE_NOT_ESTIMABLE,
+                f"batch {b}: a strategy stratum has exactly 1 sample; its "
+                f"variance contribution is not estimable"))
+        batch_records.append(brec)
+        if b < n_batches - 1 and updater is not None:
+            raw = updater(brec)
+            (nwr, nwc), clamped = _coerce_updated_weights(raw, b, fl)
+            diagnostics.append(Diagnostic(
+                DIAG_WEIGHTS_UPDATED,
+                f"after batch {b}: next-batch weights "
+                f"({nwr:.6g}, {nwc:.6g})"))
+            if clamped:
+                diagnostics.append(Diagnostic(
+                    DIAG_WEIGHTS_CLAMPED,
+                    f"after batch {b}: updater weights {tuple(raw)!r} violated "
+                    f"the floor {fl!r}; clamped to ({nwr:.6g}, {nwc:.6g})"))
+            cur = (nwr, nwc)
+
+    est = math.fsum(b.estimate for b in batch_records) / n_batches
+    if any(b.variance is None for b in batch_records):
+        variance = None
+    else:
+        variance = math.fsum(b.variance for b in batch_records) / (
+            n_batches * n_batches)
+    all_records = tuple(r for b in batch_records for r in b.records)
+
+    return AdaptiveResult(
+        estimate=est,
+        variance=variance,
+        stddev=math.sqrt(variance) if variance is not None else None,
+        exact=math.fsum(g),
+        n_batches=n_batches,
+        samples_per_batch=m,
+        floor=fl,
+        initial_weights=(ar, ac),
+        final_weights=(batch_records[-1].weight_radiance,
+                       batch_records[-1].weight_cosine),
+        batch_records=tuple(batch_records),
+        records=all_records,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def variance_minimizing_updater():
+    """Built-in updater: allocate the next batch proportional to the current
+    batch's empirical per-strategy standard deviation of a single draw's
+    balance-heuristic contribution (w_s ~ sigma_s).
+
+    This is the standard variance-minimizing allocation heuristic; it is not
+    a global optimum guarantee because each draw's value itself depends on
+    the allocation. If a stratum cannot be estimated (fewer than 2 draws) the
+    previous weights are kept. Zero empirical variance drives a weight to
+    zero; the driver then clamps it back to the positivity floor.
+    """
+    def update(brec):
+        by_strategy = {STRATEGY_RADIANCE: [], STRATEGY_COSINE: []}
+        for r in brec.records:
+            by_strategy[r.strategy].append(r.contribution)
+        sigmas = []
+        for xs in (by_strategy[STRATEGY_RADIANCE], by_strategy[STRATEGY_COSINE]):
+            if len(xs) < 2:
+                return (brec.weight_radiance, brec.weight_cosine)
+            sigmas.append(math.sqrt(max(0.0, _strategy_variance(xs))))
+        total = math.fsum(sigmas)
+        if total <= 0.0:
+            return (brec.weight_radiance, brec.weight_cosine)
+        return (sigmas[0] / total, sigmas[1] / total)
+
+    return update

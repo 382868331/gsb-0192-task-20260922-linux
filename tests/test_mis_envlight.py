@@ -15,20 +15,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mis_envlight import (
     MAX_PATCHES,
+    MAX_BATCHES,
+    MIN_STRATEGY_WEIGHT,
     STRATEGY_RADIANCE,
     STRATEGY_COSINE,
     DIAG_ZERO_PDF_TERM,
     DIAG_UNREACHABLE_TERM,
     DIAG_VARIANCE_NOT_ESTIMABLE,
     DIAG_UNUSED_ZERO_MASS_STRATEGY,
+    DIAG_WEIGHTS_UPDATED,
+    DIAG_WEIGHTS_CLAMPED,
     ValidationError,
     DegenerateProposalError,
     Patch,
     Scene,
+    SampleRecord,
+    BatchRecord,
     direct_sum,
     proposal_pdfs,
     enumerate_contributions,
     estimate,
+    estimate_adaptive,
+    variance_minimizing_updater,
 )
 
 
@@ -361,6 +369,452 @@ class TestValidation(unittest.TestCase):
             direct_sum("not a scene", self.f)
         with self.assertRaises(ValidationError):
             Scene([("not", "a", "patch")])
+
+
+class TestAdaptiveAPI(unittest.TestCase):
+    """New multi-batch adaptive entry point: basic contracts."""
+
+    def setUp(self):
+        zs = [1.0, 0.8, 0.5, 0.25]
+        L = [1.5, 0.0, 3.25, 2.0]
+        w = [0.5, 0.5, 0.25, 1.0]
+        f = [1.0, 2.0, 0.5, 0.75]
+        self.scene = make_scene(zs, L, w)
+        self.zs, self.L, self.w, self.f = zs, L, w, f
+
+    def test_single_batch_matches_legacy_estimate_exactly(self):
+        # One adaptive batch with an even 50/50 split draws and scores in the
+        # exact same order as estimate(), hence must agree bit for bit.
+        old = estimate(self.scene, self.f, 5, 5, seed=123)
+        new = estimate_adaptive(self.scene, self.f, 1, 10, seed=123)
+        self.assertEqual(new.estimate, old.estimate)
+        self.assertEqual(len(new.records), len(old.records))
+        for nr, nr2 in zip(new.records, old.records):
+            self.assertEqual(nr.strategy, nr2.strategy)
+            self.assertEqual(nr.patch_index, nr2.patch_index)
+            self.assertEqual(nr.n_self, nr2.n_self)
+            self.assertEqual(nr.n_other, nr2.n_other)
+            self.assertEqual(nr.pdf_self, nr2.pdf_self)
+            self.assertEqual(nr.pdf_other, nr2.pdf_other)
+            self.assertEqual(nr.contribution, nr2.contribution)
+            self.assertEqual(nr.mis_weight, nr2.mis_weight)
+            self.assertEqual(nr.batch, 0)
+        self.assertEqual(new.estimate,
+                         math.fsum(b.estimate for b in new.batch_records))
+        self.assertEqual(new.n_batches, 1)
+        self.assertEqual(new.samples_per_batch, 10)
+
+    def test_weights_are_ratios_and_realized_split(self):
+        # (1, 3) normalizes to 0.25; m=8 realizes counts (2, 6).
+        res = estimate_adaptive(self.scene, self.f, 1, 8, seed=1,
+                                initial_weights=(1.0, 3.0))
+        self.assertAlmostEqual(res.initial_weights[0], 0.25)
+        self.assertAlmostEqual(res.initial_weights[1], 0.75)
+        b = res.batch_records[0]
+        self.assertEqual((b.n_radiance, b.n_cosine), (2, 6))
+        self.assertAlmostEqual(b.weight_radiance, 0.25)
+        self.assertAlmostEqual(b.weight_cosine, 0.75)
+
+    def test_reproducible(self):
+        kw = dict(n_batches=3, samples_per_batch=12,
+                  updater=lambda br: (0.8, 0.2))
+        a = estimate_adaptive(self.scene, self.f, seed=77, floor=0.05, **kw)
+        b = estimate_adaptive(self.scene, self.f, seed=77, floor=0.05, **kw)
+        self.assertEqual(a, b)
+        self.assertIn("batch", a.explain())
+
+    def test_earlier_batches_immune_to_later_updates(self):
+        # Two runs whose updaters agree on the batch-0 weights but diverge
+        # afterwards: batch 0 draws and scores must be identical (its
+        # conditional mixture was frozen before any later update).
+        def u_a(br):
+            return (0.25, 0.75) if br.batch % 2 == 0 else (0.75, 0.25)
+
+        def u_b(br):
+            if br.batch == 0:
+                return (0.25, 0.75)
+            return (0.5, 0.5)
+
+        a = estimate_adaptive(self.scene, self.f, 4, 4, seed=9,
+                              updater=u_a, floor=0.05)
+        b = estimate_adaptive(self.scene, self.f, 4, 4, seed=9,
+                              updater=u_b, floor=0.05)
+        self.assertEqual(a.batch_records[0].records,
+                         b.batch_records[0].records)
+
+
+class TestAdaptiveUnbiasedness(unittest.TestCase):
+    """Conditional-PDF scoring: per-batch identity and aggregate unbiasedness."""
+
+    def setUp(self):
+        self.zs = [1.0, 0.8, 0.5, 0.25]
+        self.L = [1.5, 0.0, 3.25, 2.0]
+        self.w = [1.0, 1.0, 1.0, 1.0]
+        self.f = [1.0, 2.0, 0.5, 0.75]
+        self.scene = make_scene(self.zs, self.L, self.w)
+
+    def _ref_pdfs(self):
+        # Independently recomputed proposal pdfs (plain arithmetic).
+        lm = [self.L[i] * self.w[i] for i in range(4)]
+        cm = [self.zs[i] * self.w[i] for i in range(4)]
+        pL = tuple(x / sum(lm) for x in lm)
+        pC = tuple(x / sum(cm) for x in cm)
+        return pL, pC
+
+    def test_every_adapted_batch_is_conditionally_unbiased(self):
+        # Whatever split an updater produced, batch b's conditional
+        # expectation over its own draw space must equal S:
+        #   E_b = sum_i (n_r*pL_i + n_c*pC_i) * g_i / same_denominator
+        updater = lambda br: ((0.9, 0.1) if br.batch % 2 == 0
+                              else (0.1, 0.9))
+        res = estimate_adaptive(self.scene, self.f, 5, 20, seed=2026,
+                                updater=updater, floor=0.05)
+        pL, pC = self._ref_pdfs()
+        g = [self.L[i] * self.f[i] * self.zs[i] * self.w[i]
+             for i in range(4)]
+        expected = reference_direct(self.L, self.f, self.zs, self.w)
+        for b in res.batch_records:
+            cond = 0.0
+            for i in range(4):
+                denom = b.n_radiance * pL[i] + b.n_cosine * pC[i]
+                cond += denom * g[i] / denom
+            self.assertTrue(math.isclose(cond, expected, rel_tol=1e-12),
+                            f"batch {b.batch}: {cond!r} != {expected!r}")
+
+    def test_monte_carlo_unbiased_changing_and_fixed(self):
+        # Aggregate empirical mean over many independent seeds must land
+        # within 4 standard errors of S for both regimes.
+        expected = reference_direct(self.L, self.f, self.zs, self.w)
+        flip = lambda br: ((0.9, 0.1) if br.batch % 2 == 0 else (0.1, 0.9))
+        for updater, label in ((None, "fixed"), (flip, "changing")):
+            ests = []
+            for seed in range(256):
+                r = estimate_adaptive(self.scene, self.f, 4, 16, seed,
+                                      updater=updater, floor=0.05)
+                ests.append(r.estimate)
+            mean = math.fsum(ests) / len(ests)
+            var = math.fsum((x - mean) ** 2 for x in ests) / (len(ests) - 1)
+            se = math.sqrt(var / len(ests))
+            self.assertLessEqual(abs(mean - expected), 4.0 * se,
+                                 f"{label}: mean={mean!r} S={expected!r} "
+                                 f"se={se!r}")
+
+    def test_records_freeze_their_own_batch_mixture(self):
+        # m=4: initial 0.25/0.75 realizes counts (1,3); the updater then
+        # switches batch 1 to (3,1).
+        updater = lambda br: (0.75, 0.25)
+        res = estimate_adaptive(self.scene, self.f, 2, 4, seed=3,
+                                initial_weights=(0.25, 0.75),
+                                updater=updater, floor=0.05)
+        pL, pC = self._ref_pdfs()
+        counts = [(b.n_radiance, b.n_cosine) for b in res.batch_records]
+        self.assertEqual(counts, [(1, 3), (3, 1)])
+        final = counts[-1]
+        for rec in res.records:
+            i = rec.patch_index
+            own_denom = rec.n_self * rec.pdf_self + rec.n_other * rec.pdf_other
+            # Stored contribution is scored with THIS batch's mixture.
+            self.assertTrue(math.isclose(
+                rec.contribution, rec.target_value / own_denom, rel_tol=1e-14))
+            self.assertTrue(math.isclose(
+                rec.mixture_pdf(),
+                own_denom / (rec.n_self + rec.n_other), rel_tol=1e-14))
+            # Scoring the same sample with the FINAL batch's counts changes
+            # its value: the implementation must not have done that. Skip
+            # zero-target samples (0 under every denominator).
+            if rec.batch == 0 and rec.target_value > 0.0:
+                final_denom = final[0] * pL[i] + final[1] * pC[i]
+                self.assertFalse(math.isclose(
+                    rec.contribution, rec.target_value / final_denom,
+                    rel_tol=1e-9))
+
+    def test_recalculating_old_samples_with_final_pdf_is_biased(self):
+        """Exact-rational proof of why frozen conditional pdfs are required.
+
+        Two patches, batch 1 uses counts (1,3), batch 2 uses (3,1).
+        Re-scoring batch-1 draws with the FINAL mixture (3,1) has
+        expectation 74/35 instead of S = 2; the averaged wrong estimator
+        lands at 72/35 (bias 2/35). The correct per-batch scoring equals S.
+        """
+        cos = [Fraction(1), Fraction(1, 2)]
+        L = [Fraction(1), Fraction(2)]
+        w = [Fraction(1), Fraction(1)]
+        f = [Fraction(1), Fraction(1)]
+        g = [L[i] * f[i] * cos[i] * w[i] for i in range(2)]
+        lm = [L[i] * w[i] for i in range(2)]
+        cm = [cos[i] * w[i] for i in range(2)]
+        pL = [x / sum(lm) for x in lm]
+        pC = [x / sum(cm) for x in cm]
+
+        def expected_batch_sum(nr, nc, sr, sc):
+            # Sampling mixture (nr, nc), scoring mixture (sr, sc).
+            total = Fraction(0)
+            for i in range(2):
+                sampling_mass = nr * pL[i] + nc * pC[i]
+                scoring_denom = sr * pL[i] + sc * pC[i]
+                total += sampling_mass * g[i] / scoring_denom
+            return total
+
+        correct = (expected_batch_sum(1, 3, 1, 3)
+                   + expected_batch_sum(3, 1, 3, 1)) / 2
+        forbidden = (expected_batch_sum(1, 3, 3, 1)
+                     + expected_batch_sum(3, 1, 3, 1)) / 2
+        self.assertEqual(correct, sum(g))
+        self.assertEqual(forbidden, Fraction(72, 35))
+        self.assertNotEqual(forbidden, sum(g))
+
+
+class TestAdaptiveFloorAndDegeneracy(unittest.TestCase):
+    def _scene(self):
+        return make_scene([1.0, 0.7, 0.4], [1.0, 4.0, 2.0],
+                          [0.5, 1.0, 0.25])
+
+    def test_floor_holds_on_realized_counts(self):
+        res = estimate_adaptive(self._scene(), [1.0, 1.0, 1.0], 6, 20, seed=4,
+                                updater=lambda br: (1e9, 1.0), floor=0.1)
+        lo = math.ceil(20 * 0.1 - 1e-12)
+        for b in res.batch_records:
+            self.assertGreaterEqual(b.n_radiance, lo)
+            self.assertGreaterEqual(b.n_cosine, lo)
+        # The extreme ratio was clamped onto [0.1, 0.9].
+        self.assertEqual(res.final_weights, (0.9, 0.1))
+        self.assertTrue(any(d.code == DIAG_WEIGHTS_CLAMPED
+                            for d in res.diagnostics))
+
+    def test_fixed_distribution_half_floor(self):
+        # floor=0.5 forces an even split and clamps every updater request.
+        res = estimate_adaptive(self._scene(), [1.0, 1.0, 1.0], 4, 4, seed=2,
+                                floor=0.5, updater=lambda br: (0.99, 0.01))
+        for b in res.batch_records:
+            self.assertEqual((b.n_radiance, b.n_cosine), (2, 2))
+        self.assertEqual(sum(d.code == DIAG_WEIGHTS_CLAMPED
+                             for d in res.diagnostics), 3)
+
+    def test_fixed_distribution_without_updater(self):
+        res = estimate_adaptive(self._scene(), [1.0, 1.0, 1.0], 3, 10, seed=8,
+                                initial_weights=(0.3, 0.7))
+        for b in res.batch_records:
+            self.assertEqual((b.n_radiance, b.n_cosine), (3, 7))
+        self.assertFalse(any(d.code == DIAG_WEIGHTS_UPDATED
+                             for d in res.diagnostics))
+
+    def test_in_bounds_ratio_is_not_falsely_reported_as_clamped(self):
+        # A well-formed updater whose returned ratio is already inside the
+        # floor band (despite float renormalization) must not be flagged.
+        calls = []
+
+        def updater(br):
+            w = (0.3 + 1e-13, 0.7)
+            calls.append(w)
+            return w
+
+        res = estimate_adaptive(self._scene(), [1.0, 1.0, 1.0], 2, 8, seed=0,
+                                updater=updater, floor=0.1)
+        self.assertFalse(any(d.code == DIAG_WEIGHTS_CLAMPED
+                             for d in res.diagnostics))
+        self.assertEqual(len(calls), 1)
+
+    def test_distribution_changes_between_batches(self):
+        seen = []
+
+        def updater(br):
+            seen.append((br.batch, br.n_radiance, br.n_cosine))
+            return (0.8, 0.2) if br.batch == 0 else (0.2, 0.8)
+
+        res = estimate_adaptive(self._scene(), [1.0, 1.0, 1.0], 3, 10, seed=5,
+                                updater=updater, floor=0.1)
+        splits = [(b.n_radiance, b.n_cosine) for b in res.batch_records]
+        self.assertEqual(splits[0], (5, 5))
+        self.assertNotEqual(splits[1], splits[0])
+        self.assertEqual(seen, [(0, 5, 5), (1, 8, 2)])
+        self.assertEqual(sum(d.code == DIAG_WEIGHTS_UPDATED
+                             for d in res.diagnostics), 2)
+        self.assertEqual(res.final_weights, (0.2, 0.8))
+
+    def test_updater_not_called_for_single_batch(self):
+        def boom(br):
+            raise AssertionError("updater must not run after the last batch")
+
+        res = estimate_adaptive(self._scene(), [1.0, 1.0, 1.0], 1, 4, seed=0,
+                                updater=boom)
+        self.assertEqual(len(res.batch_records), 1)
+
+    def test_zero_energy_scene_rejected_up_front(self):
+        dark = make_scene([1.0, 0.5], [0.0, 0.0])
+        with self.assertRaises(DegenerateProposalError):
+            estimate_adaptive(dark, [1.0, 1.0], 3, 6, seed=1)
+
+    def test_all_grazing_scene_rejected_up_front(self):
+        flat = make_scene([0.0, 0.0], [1.0, 2.0])
+        with self.assertRaises(DegenerateProposalError):
+            estimate_adaptive(flat, [1.0, 1.0], 3, 6, seed=1)
+
+    def test_initial_weights_at_floor_boundary_accepted(self):
+        # Exactly on the floor is legal; just below is rejected.
+        estimate_adaptive(self._scene(), [1.0, 1.0, 1.0], 1, 10, seed=1,
+                          initial_weights=(0.001, 0.999))
+        with self.assertRaises(ValidationError):
+            estimate_adaptive(self._scene(), [1.0, 1.0, 1.0], 1, 10, seed=1,
+                              initial_weights=(0.0009, 0.9991))
+
+    def test_unrealizable_integer_floor_rejected(self):
+        # m=3, floor=0.5: each strategy would need 2 of 3 draws.
+        with self.assertRaises(ValidationError):
+            estimate_adaptive(self._scene(), [1.0, 1.0, 1.0], 2, 3, seed=1,
+                              floor=0.5)
+        # m=4, floor=0.5 is realizable as (2,2).
+        res = estimate_adaptive(self._scene(), [1.0, 1.0, 1.0], 1, 4, seed=1,
+                                floor=0.5)
+        self.assertEqual((res.batch_records[0].n_radiance,
+                          res.batch_records[0].n_cosine), (2, 2))
+
+
+class TestAdaptiveVariance(unittest.TestCase):
+    def test_variance_formula_recomputed_independently(self):
+        scene = make_scene([1.0, 0.9, 0.5, 0.2],
+                           [1.0, 2.0, 0.5, 3.0])
+        res = estimate_adaptive(scene, [1.0, 0.5, 2.0, 1.0], 5, 8, seed=6)
+        # Independent recompute: per-batch stratified variance, then the
+        # variance of the mean of independent batches.
+        total = 0.0
+        for b in res.batch_records:
+            groups = {STRATEGY_RADIANCE: [], STRATEGY_COSINE: []}
+            for r in b.records:
+                groups[r.strategy].append(r.contribution)
+            vb = 0.0
+            for xs in groups.values():
+                mean = math.fsum(xs) / len(xs)
+                s2 = math.fsum((x - mean) ** 2 for x in xs) / (len(xs) - 1)
+                vb += len(xs) * s2
+            total += vb
+        expected_var = total / 25.0
+        self.assertTrue(math.isclose(res.variance, expected_var, rel_tol=1e-12))
+        self.assertTrue(math.isclose(res.stddev, math.sqrt(res.variance)))
+
+    def test_single_draw_stratum_makes_variance_none(self):
+        scene = make_scene([1.0, 0.7, 0.3], [1.0, 2.0, 0.5])
+        # m=4 with a 0.25 share realizes (1,3): the 1-draw stratum has no
+        # sample variance, per batch and for the whole run.
+        res = estimate_adaptive(scene, [1.0, 0.5, 2.0], 3, 4, seed=6,
+                                initial_weights=(0.25, 0.75), floor=0.05)
+        self.assertIsNone(res.variance)
+        self.assertIsNone(res.stddev)
+        self.assertEqual(sum(d.code == DIAG_VARIANCE_NOT_ESTIMABLE
+                             for d in res.diagnostics), 3)
+
+    def test_single_patch_scene_zero_variance(self):
+        scene = make_scene([0.6], [2.5], [0.75])
+        res = estimate_adaptive(scene, [1.5], 4, 8, seed=0)
+        expected = reference_direct([2.5], [1.5], [0.6], [0.75])
+        self.assertEqual(res.estimate, expected)
+        self.assertEqual(res.variance, 0.0)
+
+
+class TestAdaptiveValidation(unittest.TestCase):
+    def setUp(self):
+        self.scene = make_scene([1.0, 0.5], [1.0, 2.0])
+        self.f = [1.0, 1.0]
+
+    def _call(self, **over):
+        kw = dict(n_batches=2, samples_per_batch=4, seed=1)
+        kw.update(over)
+        return estimate_adaptive(self.scene, self.f, **kw)
+
+    def test_batch_counts(self):
+        for bad in (0, -1, True, 1.5, "2", MAX_BATCHES + 1):
+            with self.assertRaises(ValidationError):
+                self._call(n_batches=bad)
+        # Boundary value is accepted and runs.
+        self.assertEqual(self._call(n_batches=1, samples_per_batch=2).n_batches, 1)
+        self._call(n_batches=MAX_BATCHES, samples_per_batch=2)
+
+    def test_samples_per_batch(self):
+        for bad in (0, 1, -2, False, 2.0):
+            with self.assertRaises(ValidationError):
+                self._call(samples_per_batch=bad)
+
+    def test_floor(self):
+        for bad in (0.0, -0.1, 0.51, math.nan, math.inf, "x"):
+            with self.assertRaises(ValidationError):
+                self._call(floor=bad)
+
+    def test_initial_weights(self):
+        for bad in ((0.0, 1.0), (-0.1, 1.0), (1.0,), (1.0, 1.0, 1.0),
+                    "50/50", (math.nan, 1.0), None):
+            with self.assertRaises(ValidationError):
+                self._call(initial_weights=bad)
+
+    def test_seed(self):
+        for bad in (True, 1.5, "1", None):
+            with self.assertRaises(ValidationError):
+                self._call(seed=bad)
+
+    def test_updater_type_and_bad_returns_abort_run(self):
+        with self.assertRaises(ValidationError):
+            self._call(updater="not callable")
+        for bad in ((1.0,), (1.0, 1.0, 0.0), (math.nan, 1.0),
+                    (-0.5, 1.0), (0.0, 0.0), "0.5/0.5", None):
+            def updater(br, bad=bad):
+                return bad
+            with self.assertRaises(ValidationError):
+                self._call(n_batches=3, updater=updater)
+
+    def test_inherited_scene_and_f_validation(self):
+        with self.assertRaises(ValidationError):
+            estimate_adaptive("not a scene", self.f, 2, 4, seed=1)
+        with self.assertRaises(ValidationError):
+            estimate_adaptive(self.scene, [1.0], 2, 4, seed=1)
+        with self.assertRaises(ValidationError):
+            estimate_adaptive(self.scene, [1.0, -1.0], 2, 4, seed=1)
+
+
+class TestVarianceMinimizingUpdater(unittest.TestCase):
+    def _brec(self, rad_contribs, cos_contribs, prev=(0.3, 0.7)):
+        def rec(strategy, k, value, n_self):
+            other = len(cos_contribs) if strategy == STRATEGY_RADIANCE \
+                else len(rad_contribs)
+            return SampleRecord(
+                strategy=strategy, draw=k, patch_index=k % 2,
+                n_self=n_self, n_other=other,
+                pdf_self=0.5, pdf_other=0.5, mis_weight=0.5,
+                target_value=value, contribution=value, batch=0)
+        records = tuple(
+            [rec(STRATEGY_RADIANCE, k, v, len(rad_contribs))
+             for k, v in enumerate(rad_contribs)]
+            + [rec(STRATEGY_COSINE, k, v, len(cos_contribs))
+               for k, v in enumerate(cos_contribs)])
+        return BatchRecord(
+            batch=0, samples_per_batch=len(records),
+            n_radiance=len(rad_contribs), n_cosine=len(cos_contribs),
+            weight_radiance=prev[0], weight_cosine=prev[1],
+            estimate=0.0, variance=0.0, records=records)
+
+    def test_equal_spread_equal_weights(self):
+        w = variance_minimizing_updater()(self._brec([0.0, 2.0], [0.0, 2.0]))
+        self.assertTrue(math.isclose(w[0], 0.5))
+        self.assertTrue(math.isclose(w[1], 0.5))
+
+    def test_all_mass_goes_to_spread_stratum_before_floor(self):
+        w = variance_minimizing_updater()(self._brec([0.0, 2.0], [5.0, 5.0]))
+        self.assertEqual(w, (1.0, 0.0))  # driver clamps this to the floor
+
+    def test_zero_variance_keeps_previous_weights(self):
+        w = variance_minimizing_updater()(self._brec([3.0, 3.0], [3.0, 3.0]))
+        self.assertEqual(w, (0.3, 0.7))
+
+    def test_single_draw_stratum_keeps_previous_weights(self):
+        w = variance_minimizing_updater()(
+            self._brec([1.0], [1.0, 2.0, 3.0]))
+        self.assertEqual(w, (0.3, 0.7))
+
+    def test_end_to_end_clamps_and_runs(self):
+        scene = make_scene([1.0, 0.8, 0.5, 0.25], [1.0, 0.1, 3.0, 0.2])
+        res = estimate_adaptive(scene, [1.0, 1.0, 1.0, 1.0], 4, 16, seed=11,
+                                updater=variance_minimizing_updater(),
+                                floor=0.05)
+        for b in res.batch_records:
+            self.assertGreaterEqual(b.n_radiance, 1)
+            self.assertGreaterEqual(b.n_cosine, 1)
 
 
 if __name__ == "__main__":

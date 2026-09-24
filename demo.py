@@ -9,9 +9,12 @@ from mis_envlight import (
     Patch,
     Scene,
     estimate,
+    estimate_adaptive,
+    variance_minimizing_updater,
     direct_sum,
     ValidationError,
     DegenerateProposalError,
+    DIAG_WEIGHTS_CLAMPED,
 )
 
 
@@ -91,6 +94,96 @@ def main():
         estimate(dark, [1.0], 2, 0, seed=1)
     except DegenerateProposalError as exc:
         print(f"DegenerateProposalError:        {exc}")
+
+    print()
+    print("=== Multi-batch adaptive MIS ===")
+    # Small hand-built scene: 3 patches, all quantities explicit so the
+    # exact value can be checked by hand:
+    #   g = L*f*cos*w = 1*1*1, 2*1*0.5, 1*2*0.25 = 1.0, 1.0, 0.5  ->  S = 2.5
+    ascene = Scene([
+        Patch(direction=(0.0, 0.0, 1.0), radiance=1.0, weight=1.0),
+        Patch(direction=(math.sqrt(0.75), 0.0, 0.5), radiance=2.0, weight=1.0),
+        Patch(direction=(math.sqrt(1.0 - 0.25 ** 2), 0.0, 0.25),
+              radiance=1.0, weight=1.0),
+    ])
+    af = [1.0, 1.0, 2.0]
+    print(f"hand-built 3-patch scene, exact S = {direct_sum(ascene, af):.3f} "
+          f"(hand check: 1.0 + 1.0 + 0.5 = 2.5)")
+
+    # (a) Fixed distribution: no updater, the split never moves.
+    fix = estimate_adaptive(ascene, af, n_batches=4, samples_per_batch=8,
+                            seed=20260924)
+    print(f"[fixed]   estimate={fix.estimate:.6f}  stddev={fix.stddev:.6f}  "
+          f"splits={[(b.n_radiance, b.n_cosine) for b in fix.batch_records]}")
+
+    # (b) Distribution changes between batches: a deterministic updater
+    # alternates the allocation 20/80 <-> 80/20 after every batch. The
+    # estimator stays close to S because every batch is unbiased on its own
+    # conditional mixture; old samples keep the pdfs they were drawn with.
+    def alternate(brec):
+        return (0.8, 0.2) if brec.batch % 2 == 0 else (0.2, 0.8)
+
+    adapt = estimate_adaptive(ascene, af, n_batches=4, samples_per_batch=64,
+                              seed=20260924, updater=alternate, floor=0.05)
+    print(f"[adaptive] estimate={adapt.estimate:.6f}  "
+          f"stddev={adapt.stddev:.6f}  (exact 2.500000)")
+    print(adapt.explain())
+    print("weights initial -> final: "
+          f"({adapt.initial_weights[0]:.3f},{adapt.initial_weights[1]:.3f}) -> "
+          f"({adapt.final_weights[0]:.3f},{adapt.final_weights[1]:.3f})")
+    # Conditional scoring: batch 0 keeps its original split even though the
+    # final batch uses a different one.
+    b0, bL = adapt.batch_records[0], adapt.batch_records[-1]
+    print(f"conditional scoring: batch 0 scored at "
+          f"({b0.n_radiance},{b0.n_cosine}), final batch at "
+          f"({bL.n_radiance},{bL.n_cosine}); old records are not rescored")
+
+    # (c) The built-in variance-minimizing updater on the 16-patch scene:
+    # it nudges the split toward whichever strategy's single-draw
+    # contributions varied more in the preceding batch.
+    var = estimate_adaptive(scene, f, n_batches=4, samples_per_batch=64,
+                            seed=20260922,
+                            updater=variance_minimizing_updater(),
+                            floor=0.05)
+    splits = [(b.n_radiance, b.n_cosine) for b in var.batch_records]
+    print(f"[variance updater] estimate={var.estimate:.6f} "
+          f"(exact {direct_sum(scene, f):.6f}) splits={splits}")
+
+    print()
+    print("=== Adaptive boundary: positive-probability floor enforced ===")
+    # Updater asks for (1.0, 0.0) — zero probability for cosine. It is not
+    # applied: the request is clamped to the floor and reported explicitly.
+    clamped = estimate_adaptive(
+        ascene, af, n_batches=2, samples_per_batch=10, seed=1, floor=0.1,
+        updater=lambda br: (1.0, 0.0))
+    for b in clamped.batch_records:
+        print(f"  batch {b.batch}: realized split "
+              f"({b.n_radiance},{b.n_cosine}) "
+              f"shares=({b.weight_radiance:.2f},{b.weight_cosine:.2f})")
+    for d in clamped.diagnostics:
+        if d.code == DIAG_WEIGHTS_CLAMPED:
+            print(f"  [{d.code}] {d.message}")
+
+    print()
+    print("=== Adaptive rejections ===")
+    # 1. A malformed updater return (NaN) aborts the whole run — no
+    # half-updated result is returned.
+    try:
+        estimate_adaptive(ascene, af, 3, 8, seed=1,
+                          updater=lambda br: (0.5, float("nan")))
+    except ValidationError as exc:
+        print(f"ValidationError (bad updater): {exc}")
+    # 2. floor=0.5 cannot be realized with 3 draws per batch.
+    try:
+        estimate_adaptive(ascene, af, 2, 3, seed=1, floor=0.5)
+    except ValidationError as exc:
+        print(f"ValidationError (unrealizable floor): {exc}")
+    # 3. Adaptive runs keep both strategies active every batch, so a
+    # zero-energy scene's degenerate radiance proposal is rejected up front.
+    try:
+        estimate_adaptive(dark, [1.0], 2, 8, seed=1)
+    except DegenerateProposalError as exc:
+        print(f"DegenerateProposalError (adaptive): {exc}")
 
 
 if __name__ == "__main__":
