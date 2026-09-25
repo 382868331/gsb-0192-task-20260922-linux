@@ -9,6 +9,7 @@ from mis_envlight import (
     Patch,
     Scene,
     estimate,
+    estimate_with_control,
     direct_sum,
     ValidationError,
     DegenerateProposalError,
@@ -61,8 +62,37 @@ def main():
     print(res.explain(limit=4))
     print()
 
-    print("=== Diagnostics demo: grazing patch (cos = 0) ===")
-    # Patch 1 lies exactly on the horizon: the cosine strategy assigns it
+    print("=== Control variate: two-phase estimator (same total budget) ===")
+    # Correlated control: neighbor-smoothed f. The caller knows its exact
+    # discrete integral G (computed here once, exactly, as the caller would).
+    g = [0.5 * (f[k] + f[(k + 1) % len(f)]) for k in range(len(f))]
+    G = direct_sum(scene, g)
+    # Budget: pilot 16+16 + main 48+48 = 128 = the plain run's 64+64.
+    cv = estimate_with_control(scene, f, g, G, 48, 48, 16, 16, seed=seed)
+    print(f"pilot: n_radiance={cv.n_pilot_radiance} "
+          f"n_cosine={cv.n_pilot_cosine} | main: n_radiance={cv.n_radiance} "
+          f"n_cosine={cv.n_cosine} | total={cv.total_samples}")
+    print(f"beta (fixed by pilot) = {cv.beta:.6f}")
+    print(f"controlled estimate = {cv.estimate:.10f} "
+          f"(residual {cv.residual_estimate:.10f} + beta*G)")
+    print(f"abs error = {abs(cv.estimate - exact):.3e}   "
+          f"estimated stddev = {cv.stddev:.6f}")
+    print(f"plain run stddev    = {res.stddev:.6f} (same 128-sample budget)")
+    # Finite-seed sweep at equal budget: observed spread of both estimators.
+    # This is a property of this scene/control/seed set, not a guarantee.
+    def spread(estimates):
+        m = math.fsum(estimates) / len(estimates)
+        return math.fsum((e - m) ** 2 for e in estimates) / (len(estimates) - 1)
+    plain_runs, ctrl_runs = [], []
+    for s in range(12):
+        plain_runs.append(estimate(scene, f, 64, 64, seed=1000 + s).estimate)
+        ctrl_runs.append(estimate_with_control(scene, f, g, G, 48, 48, 16, 16,
+                                               seed=1000 + s).estimate)
+    print(f"12-seed spread: plain {spread(plain_runs):.3e} vs "
+          f"controlled {spread(ctrl_runs):.3e} (scenario-specific)")
+    print()
+
+    print("=== Diagnostics demo: grazing patch (cos = 0) ===")    # Patch 1 lies exactly on the horizon: the cosine strategy assigns it
     # zero probability, which the estimator reports as a diagnostic.
     gscene = Scene([
         Patch(direction=(0.0, 0.0, 1.0), radiance=1.0, weight=1.0),
