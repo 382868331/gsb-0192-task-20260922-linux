@@ -1,6 +1,7 @@
-"""Demo for mis_envlight: estimate vs. exact, plus triggered rejections.
+"""Demo for mis_envlight: estimate vs. exact, control variates, rejections.
 
-Deterministic inputs, real computation, no network. Runs in well under 8s.
+Deterministic inputs, real computation, no network. Runs in well under 90s
+(measured: ~0.1s).
 """
 
 import math
@@ -9,6 +10,7 @@ from mis_envlight import (
     Patch,
     Scene,
     estimate,
+    estimate_with_control,
     direct_sum,
     ValidationError,
     DegenerateProposalError,
@@ -74,6 +76,57 @@ def main():
         print(f"  [{d.code}] {d.message}")
     print()
 
+    print("=== Control variate: two-phase estimate (pilot + main) ===")
+    # Control array g_i: a constant-f approximation of the target summands,
+    # g_i = L_i * f_bar * cos_i * w_i with f_bar the radiance-weighted mean
+    # of f. Its exact discrete integral G = sum_i g_i is known in closed
+    # form, so the caller supplies it directly.
+    f_bar = math.fsum(
+        scene.radiance[i] * scene.weight[i] * f[i]
+        for i in range(len(scene))) / math.fsum(
+        scene.radiance[i] * scene.weight[i] for i in range(len(scene)))
+    control = [scene.radiance[i] * f_bar * scene.cosine[i] * scene.weight[i]
+               for i in range(len(scene))]
+    control_sum = math.fsum(control)  # caller-known exact G
+    n_pr, n_pc, n_mr, n_mc = 16, 16, 48, 48
+    cres = estimate_with_control(scene, f, control, control_sum,
+                                 n_pr, n_pc, n_mr, n_mc, seed)
+    print(f"pilot: n_radiance={n_pr} n_cosine={n_pc}   "
+          f"main: n_radiance={n_mr} n_cosine={n_mc}   "
+          f"total budget n_total={cres.n_total}")
+    print(f"beta (frozen after pilot) = {cres.beta:.6f}")
+    print(f"residual estimate = {cres.residual_estimate:.10f}  "
+          f"+ beta*G = {cres.beta * control_sum:.10f}")
+    print(f"estimate  = {cres.estimate:.10f}")
+    print(f"exact     = {exact:.10f}")
+    print(f"abs error = {abs(cres.estimate - exact):.3e} "
+          f"(estimated stddev {cres.stddev:.3e})")
+    print()
+    print("=== Seed sweep at equal total budget (32 seeds) ===")
+    # Plain estimator gets 128 samples; the control estimator spends
+    # 16+16 on the pilot and 48+48 on the main phase — same total.
+    # The comparison is over the aggregate MSE of all seeds: a variance
+    # drop in one seed proves nothing and is not claimed.
+    plain_err2 = ctrl_err2 = 0.0
+    seeds = range(5000, 5032)
+    for s in seeds:
+        p = estimate(scene, f, 64, 64, s)
+        c = estimate_with_control(scene, f, control, control_sum,
+                                  16, 16, 48, 48, s)
+        plain_err2 += (p.estimate - exact) ** 2
+        ctrl_err2 += (c.estimate - exact) ** 2
+    n_seeds = len(list(seeds))
+    print(f"plain   MSE over {n_seeds} seeds (128 samples each): "
+          f"{plain_err2 / n_seeds:.6e}")
+    print(f"control MSE over {n_seeds} seeds ( 32 pilot + 96 main): "
+          f"{ctrl_err2 / n_seeds:.6e}")
+    print("(variance reduction is an aggregate observation for THIS "
+          "well-correlated control, not a general guarantee)")
+    print()
+    print("=== Per-sample explanation with control (first 3 main samples) ===")
+    print(cres.explain(limit=3))
+    print()
+
     print("=== Triggered rejection boundaries ===")
     # 1. NaN radiance is rejected with a locatable error.
     try:
@@ -91,6 +144,12 @@ def main():
         estimate(dark, [1.0], 2, 0, seed=1)
     except DegenerateProposalError as exc:
         print(f"DegenerateProposalError:        {exc}")
+    # 4. NaN in the control array is rejected with a locatable error.
+    try:
+        estimate_with_control(scene, f, [math.nan] * len(scene), 0.0,
+                              4, 4, 8, 8, seed=1)
+    except ValidationError as exc:
+        print(f"ValidationError (NaN control):  {exc}")
 
 
 if __name__ == "__main__":

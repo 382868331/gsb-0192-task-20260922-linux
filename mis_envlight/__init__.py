@@ -12,6 +12,7 @@ from .core import (
     DIAG_UNREACHABLE_TERM,
     DIAG_VARIANCE_NOT_ESTIMABLE,
     DIAG_UNUSED_ZERO_MASS_STRATEGY,
+    DIAG_PILOT_ZERO_VARIANCE,
     MisEnvLightError,
     ValidationError,
     DegenerateProposalError,
@@ -20,11 +21,13 @@ from .core import (
     Diagnostic,
     SampleRecord,
     EstimateResult,
+    ControlEstimateResult,
     ContributionTable,
     direct_sum,
     proposal_pdfs,
     enumerate_contributions,
     estimate,
+    estimate_with_control,
 )
 
 __all__ = [
@@ -36,6 +39,7 @@ __all__ = [
     "DIAG_UNREACHABLE_TERM",
     "DIAG_VARIANCE_NOT_ESTIMABLE",
     "DIAG_UNUSED_ZERO_MASS_STRATEGY",
+    "DIAG_PILOT_ZERO_VARIANCE",
     "MisEnvLightError",
     "ValidationError",
     "DegenerateProposalError",
@@ -44,9 +48,11 @@ __all__ = [
     "Diagnostic",
     "SampleRecord",
     "EstimateResult",
+    "ControlEstimateResult",
     "ContributionTable",
     "direct_sum",
     "proposal_pdfs",
     "enumerate_contributions",
     "estimate",
+    "estimate_with_control",
 ]
