@@ -61,6 +61,29 @@ def main():
     print(res.explain(limit=4))
     print()
 
+    print("=== Tilted surface normal (scene + normal rotated) ===")
+    # A 90-degree rotation about the y axis: (x, y, z) -> (z, y, -x).
+    def rot_y90(v):
+        x, y, z = v
+        return (z, y, -x)
+
+    normal = (3.0 / 5.0, 0.0, 4.0 / 5.0)
+    tilted = Scene([
+        Patch(direction=rot_y90(scene.directions[k]),
+              radiance=scene.radiance[k], weight=scene.weight[k])
+        for k in range(len(scene))
+    ])
+    exact_n = direct_sum(scene, f, normal=normal)
+    res_n = estimate(scene, f, 64, 64, seed=20260922, normal=normal)
+    res_r = estimate(tilted, f, 64, 64, seed=20260922,
+                     normal=rot_y90(normal))
+    print(f"normal={normal}")
+    print(f"exact (tilted normal)       = {exact_n:.10f}")
+    print(f"estimate (tilted normal)    = {res_n.estimate:.10f}")
+    print(f"estimate (rotated scene+N)  = {res_r.estimate:.10f} "
+          f"(identical: {res_n.estimate == res_r.estimate})")
+    print()
+
     print("=== Diagnostics demo: grazing patch (cos = 0) ===")
     # Patch 1 lies exactly on the horizon: the cosine strategy assigns it
     # zero probability, which the estimator reports as a diagnostic.

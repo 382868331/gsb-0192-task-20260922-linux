@@ -6,6 +6,7 @@ Public API is defined in mis_envlight.core; see README.md for the contract.
 from .core import (
     MAX_PATCHES,
     NORM_TOLERANCE,
+    DEFAULT_NORMAL,
     STRATEGY_RADIANCE,
     STRATEGY_COSINE,
     DIAG_ZERO_PDF_TERM,
@@ -30,6 +31,7 @@ from .core import (
 __all__ = [
     "MAX_PATCHES",
     "NORM_TOLERANCE",
+    "DEFAULT_NORMAL",
     "STRATEGY_RADIANCE",
     "STRATEGY_COSINE",
     "DIAG_ZERO_PDF_TERM",

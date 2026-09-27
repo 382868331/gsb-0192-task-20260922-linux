@@ -2,13 +2,20 @@
 
 Estimates the hemispheric sum
 
-    S = sum_i  L_i * f_i * cos_i * w_i
+    S = sum_i  L_i * f_i * cos_i * w_i,   cos_i = max(dot(d_i, n), 0)
 
 over a scene of at most ``MAX_PATCHES`` discrete patches, using multiple
 importance sampling (balance heuristic) with two proposal distributions:
 
   * radiance strategy: p_i proportional to L_i * w_i
   * cosine strategy:   q_i proportional to cos_i * w_i
+
+The caller may specify the surface normal ``n`` per query (default
+``(0, 0, 1)``). Both the target terms and the cosine proposal are derived
+from the same ``cos_i`` values, so sampling directions and sampling
+probabilities always move together; directions on the back side of the
+surface (``dot(d_i, n) <= 0``) contribute nothing and are never sampled by
+the cosine strategy.
 
 Under the scene contract the patches have equal solid angle, so including
 ``w_i`` does not change the normalized proposals; it is kept so that
@@ -36,6 +43,7 @@ from typing import Sequence
 __all__ = [
     "MAX_PATCHES",
     "NORM_TOLERANCE",
+    "DEFAULT_NORMAL",
     "STRATEGY_RADIANCE",
     "STRATEGY_COSINE",
     "DIAG_ZERO_PDF_TERM",
@@ -62,6 +70,9 @@ MAX_PATCHES = 64
 
 #: Tolerance on |direction| - 1 when validating unit directions.
 NORM_TOLERANCE = 1e-9
+
+#: Default surface normal used when the caller does not specify one.
+DEFAULT_NORMAL = (0.0, 0.0, 1.0)
 
 STRATEGY_RADIANCE = "radiance"
 STRATEGY_COSINE = "cosine"
@@ -121,7 +132,7 @@ def _check_count(name, value):
     return value
 
 
-def _check_direction(name, value):
+def _check_unit_vector(name, value):
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise ValidationError(
             f"{name}: expected a sequence of 3 numbers, got {type(value).__name__}")
@@ -135,10 +146,12 @@ def _check_direction(name, value):
         raise ValidationError(
             f"{name}: expected a unit vector, |v| = {norm!r} "
             f"(tolerance {NORM_TOLERANCE})")
-    if z < 0.0:
-        raise ValidationError(
-            f"{name}: z must be >= 0 (upper hemisphere), got {z!r}")
     return (x, y, z)
+
+
+def _check_normal(normal):
+    """Validate the caller-specified surface normal (any unit 3-vector)."""
+    return _check_unit_vector("normal", normal)
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +162,9 @@ def _check_direction(name, value):
 class Patch:
     """One hemispheric patch.
 
-    direction: unit 3-vector (x, y, z) with z >= 0 (upper hemisphere).
+    direction: unit 3-vector (x, y, z); any direction on the sphere is
+        accepted. Directions on the back side of the queried surface
+        normal simply contribute zero.
     radiance:  finite, >= 0.
     weight:    finite, > 0 (solid-angle weight of the patch).
     """
@@ -161,8 +176,8 @@ class Patch:
 class Scene:
     """Validated, immutable set of 1..MAX_PATCHES hemispheric patches."""
 
-    __slots__ = ("directions", "radiance", "weight", "cosine",
-                 "lum_mass", "cos_mass", "lum_total", "cos_total")
+    __slots__ = ("directions", "radiance", "weight",
+                 "lum_mass", "lum_total")
 
     def __init__(self, patches):
         if isinstance(patches, (str, bytes)) or not isinstance(patches, Sequence):
@@ -174,27 +189,23 @@ class Scene:
         if len(patches) > MAX_PATCHES:
             raise ValidationError(
                 f"patches: at most {MAX_PATCHES} patches allowed, got {len(patches)}")
-        directions, radiance, weight, cosine = [], [], [], []
+        directions, radiance, weight = [], [], []
         for i, p in enumerate(patches):
             if not isinstance(p, Patch):
                 raise ValidationError(
                     f"patches[{i}]: expected Patch, got {type(p).__name__}")
-            d = _check_direction(f"patches[{i}].direction", p.direction)
+            d = _check_unit_vector(f"patches[{i}].direction", p.direction)
             lum = _check_real(f"patches[{i}].radiance", p.radiance, minimum=0.0)
             w = _check_real(f"patches[{i}].weight", p.weight,
                             minimum=0.0, strict_minimum=True)
             directions.append(d)
             radiance.append(lum)
             weight.append(w)
-            cosine.append(d[2])
         self.directions = tuple(directions)
         self.radiance = tuple(radiance)
         self.weight = tuple(weight)
-        self.cosine = tuple(cosine)
         self.lum_mass = tuple(l * w for l, w in zip(self.radiance, self.weight))
-        self.cos_mass = tuple(c * w for c, w in zip(self.cosine, self.weight))
         self.lum_total = math.fsum(self.lum_mass)
-        self.cos_total = math.fsum(self.cos_mass)
 
     def __len__(self):
         return len(self.radiance)
@@ -209,6 +220,16 @@ def _check_scene(scene):
             f"scene: expected a Scene, got {type(scene).__name__}")
 
 
+def _cosines(scene, normal):
+    """Per-patch cos_i = max(dot(direction_i, normal), 0).
+
+    Directions on the back side of the surface (dot <= 0) yield exactly
+    0: no front-side contribution and no cosine-proposal mass.
+    """
+    return tuple(max(math.fsum(d[k] * normal[k] for k in range(3)), 0.0)
+                 for d in scene.directions)
+
+
 def _validate_f(scene, f):
     if isinstance(f, (str, bytes)) or not isinstance(f, Sequence):
         raise ValidationError(
@@ -219,7 +240,7 @@ def _validate_f(scene, f):
     return tuple(_check_real(f"f[{i}]", v, minimum=0.0) for i, v in enumerate(f))
 
 
-def _check_strategies(scene, n_radiance, n_cosine):
+def _check_strategies(scene, n_radiance, n_cosine, cos_total):
     n_radiance = _check_count("n_radiance", n_radiance)
     n_cosine = _check_count("n_cosine", n_cosine)
     if n_radiance + n_cosine == 0:
@@ -228,42 +249,49 @@ def _check_strategies(scene, n_radiance, n_cosine):
         raise DegenerateProposalError(
             "radiance strategy requested (n_radiance > 0) but sum(L*w) is zero; "
             "the proposal distribution is undefined")
-    if n_cosine > 0 and scene.cos_total == 0.0:
+    if n_cosine > 0 and cos_total == 0.0:
         raise DegenerateProposalError(
             "cosine strategy requested (n_cosine > 0) but sum(cos*w) is zero; "
             "the proposal distribution is undefined")
     return n_radiance, n_cosine
 
 
-def _target_terms(scene, f):
+def _target_terms(scene, f, cosines):
     return tuple(l * fi * c * w
-                 for l, fi, c, w in zip(scene.radiance, f, scene.cosine, scene.weight))
+                 for l, fi, c, w in zip(scene.radiance, f, cosines, scene.weight))
 
 
 # ---------------------------------------------------------------------------
 # Deterministic reference
 # ---------------------------------------------------------------------------
 
-def direct_sum(scene, f):
-    """Exact target value S = sum_i L_i * f_i * cos_i * w_i (math.fsum)."""
+def direct_sum(scene, f, normal=DEFAULT_NORMAL):
+    """Exact target value S = sum_i L_i * f_i * cos_i * w_i (math.fsum).
+
+    cos_i = max(dot(direction_i, normal), 0); normal defaults to +z.
+    """
     _check_scene(scene)
     fv = _validate_f(scene, f)
-    return math.fsum(_target_terms(scene, fv))
+    n = _check_normal(normal)
+    return math.fsum(_target_terms(scene, fv, _cosines(scene, n)))
 
 
-def proposal_pdfs(scene):
+def proposal_pdfs(scene, normal=DEFAULT_NORMAL):
     """Return (pdf_radiance, pdf_cosine) as tuples of per-patch probabilities.
 
     A strategy whose total mass is zero yields an all-zero tuple; requesting
     samples from it is rejected separately by _check_strategies.
     """
     _check_scene(scene)
+    n = _check_normal(normal)
+    cos_mass = tuple(c * w for c, w in zip(_cosines(scene, n), scene.weight))
+    cos_total = math.fsum(cos_mass)
     if scene.lum_total > 0.0:
         pdf_radiance = tuple(m / scene.lum_total for m in scene.lum_mass)
     else:
         pdf_radiance = (0.0,) * len(scene)
-    if scene.cos_total > 0.0:
-        pdf_cosine = tuple(m / scene.cos_total for m in scene.cos_mass)
+    if cos_total > 0.0:
+        pdf_cosine = tuple(m / cos_total for m in cos_mass)
     else:
         pdf_cosine = (0.0,) * len(scene)
     return pdf_radiance, pdf_cosine
@@ -285,7 +313,8 @@ class Diagnostic:
     patch_index: int | None = None
 
 
-def _diagnose(scene, g, pdf_radiance, pdf_cosine, n_radiance, n_cosine):
+def _diagnose(scene, g, pdf_radiance, pdf_cosine, n_radiance, n_cosine,
+              cos_total):
     diags = []
     active = []
     if n_radiance > 0:
@@ -322,7 +351,7 @@ def _diagnose(scene, g, pdf_radiance, pdf_cosine, n_radiance, n_cosine):
         diags.append(Diagnostic(
             DIAG_UNUSED_ZERO_MASS_STRATEGY,
             "radiance strategy unused and sum(L*w) is zero"))
-    if n_cosine == 0 and scene.cos_total == 0.0:
+    if n_cosine == 0 and cos_total == 0.0:
         diags.append(Diagnostic(
             DIAG_UNUSED_ZERO_MASS_STRATEGY,
             "cosine strategy unused and sum(cos*w) is zero"))
@@ -365,6 +394,7 @@ class EstimateResult:
     variance: float | None
     stddev: float | None
     exact: float
+    normal: tuple
     n_radiance: int
     n_cosine: int
     records: tuple
@@ -376,7 +406,8 @@ class EstimateResult:
         lines = [
             f"estimate={self.estimate!r} exact={self.exact!r} "
             f"variance={self.variance!r} "
-            f"(n_radiance={self.n_radiance}, n_cosine={self.n_cosine})",
+            f"(n_radiance={self.n_radiance}, n_cosine={self.n_cosine}, "
+            f"normal={self.normal!r})",
             "idx  strategy  patch  target_g        pdf_self   pdf_other  "
             "mis_weight  contribution",
         ]
@@ -412,7 +443,7 @@ def _strategy_variance(xs):
     return math.fsum((x - mean) ** 2 for x in xs) / (n - 1)
 
 
-def estimate(scene, f, n_radiance, n_cosine, seed):
+def estimate(scene, f, n_radiance, n_cosine, seed, normal=DEFAULT_NORMAL):
     """Run the MIS estimator with a deterministic seed.
 
     scene:      Scene instance.
@@ -420,21 +451,29 @@ def estimate(scene, f, n_radiance, n_cosine, seed):
     n_radiance: int >= 0, samples from the radiance proposal (~ L*w).
     n_cosine:   int >= 0, samples from the cosine proposal (~ cos*w).
     seed:       int (bool rejected); same seed reproduces identical results.
+    normal:     unit 3-vector; cos_i = max(dot(d_i, normal), 0).
+                Both the cosine proposal probabilities and the target
+                terms use these cos_i, so probabilities and directions
+                always stay consistent.
 
     All inputs are validated before any sampling happens, so a failed call
     leaves no partial state behind.
     """
     _check_scene(scene)
     fv = _validate_f(scene, f)
-    n_radiance, n_cosine = _check_strategies(scene, n_radiance, n_cosine)
+    n_vec = _check_normal(normal)
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValidationError(
             f"seed: expected an integer, got {type(seed).__name__}")
+    cosines = _cosines(scene, n_vec)
+    cos_total = math.fsum(c * w for c, w in zip(cosines, scene.weight))
+    n_radiance, n_cosine = _check_strategies(
+        scene, n_radiance, n_cosine, cos_total)
 
-    g = _target_terms(scene, fv)
-    pdf_radiance, pdf_cosine = proposal_pdfs(scene)
+    g = _target_terms(scene, fv, cosines)
+    pdf_radiance, pdf_cosine = proposal_pdfs(scene, n_vec)
     diagnostics = _diagnose(scene, g, pdf_radiance, pdf_cosine,
-                            n_radiance, n_cosine)
+                            n_radiance, n_cosine, cos_total)
 
     rng = random.Random(seed)
     records = []
@@ -487,6 +526,7 @@ def estimate(scene, f, n_radiance, n_cosine, seed):
         variance=variance,
         stddev=math.sqrt(variance) if variance is not None else None,
         exact=math.fsum(g),
+        normal=n_vec,
         n_radiance=n_radiance,
         n_cosine=n_cosine,
         records=tuple(records),
@@ -510,22 +550,29 @@ class ContributionTable:
     """
     n_radiance: int
     n_cosine: int
+    normal: tuple
     pdf_radiance: tuple
     pdf_cosine: tuple
     radiance: tuple | None
     cosine: tuple | None
 
 
-def enumerate_contributions(scene, f, n_radiance, n_cosine):
+def enumerate_contributions(scene, f, n_radiance, n_cosine,
+                            normal=DEFAULT_NORMAL):
     """Deterministic per-(strategy, patch) contribution table.
 
     Same validation and error semantics as estimate(), but no sampling.
+    ``normal`` has the same meaning as in estimate().
     """
     _check_scene(scene)
     fv = _validate_f(scene, f)
-    n_radiance, n_cosine = _check_strategies(scene, n_radiance, n_cosine)
-    g = _target_terms(scene, fv)
-    pdf_radiance, pdf_cosine = proposal_pdfs(scene)
+    n_vec = _check_normal(normal)
+    cosines = _cosines(scene, n_vec)
+    cos_total = math.fsum(c * w for c, w in zip(cosines, scene.weight))
+    n_radiance, n_cosine = _check_strategies(
+        scene, n_radiance, n_cosine, cos_total)
+    g = _target_terms(scene, fv, cosines)
+    pdf_radiance, pdf_cosine = proposal_pdfs(scene, n_vec)
     denom = tuple(n_radiance * pr + n_cosine * pc
                   for pr, pc in zip(pdf_radiance, pdf_cosine))
 
@@ -536,6 +583,7 @@ def enumerate_contributions(scene, f, n_radiance, n_cosine):
     return ContributionTable(
         n_radiance=n_radiance,
         n_cosine=n_cosine,
+        normal=n_vec,
         pdf_radiance=pdf_radiance,
         pdf_cosine=pdf_cosine,
         radiance=row(pdf_radiance) if n_radiance > 0 else None,

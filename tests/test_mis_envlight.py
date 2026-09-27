@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mis_envlight import (
     MAX_PATCHES,
+    DEFAULT_NORMAL,
     STRATEGY_RADIANCE,
     STRATEGY_COSINE,
     DIAG_ZERO_PDF_TERM,
@@ -30,6 +31,10 @@ from mis_envlight import (
     enumerate_contributions,
     estimate,
 )
+
+
+def dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
 
 def unit(z):
@@ -232,7 +237,7 @@ class TestDiagnostics(unittest.TestCase):
         from mis_envlight.core import _diagnose
         scene = make_scene([0.9, 0.8], [0.0, 1.0])
         g = (0.5, 1.0)  # synthetic: patch 0 has a positive target term
-        diags = _diagnose(scene, g, (0.0, 1.0), (0.0, 1.0), 1, 1)
+        diags = _diagnose(scene, g, (0.0, 1.0), (0.0, 1.0), 1, 1, 1.0)
         hits = [d for d in diags if d.code == DIAG_UNREACHABLE_TERM]
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0].patch_index, 0)
@@ -327,11 +332,24 @@ class TestValidation(unittest.TestCase):
         with self.assertRaises(ValidationError):
             Scene([Patch(direction=(0.0, 0.0, 2.0), radiance=1.0, weight=1.0)])
         with self.assertRaises(ValidationError):
-            Scene([Patch(direction=(0.0, 0.0, -1.0), radiance=1.0, weight=1.0)])
-        with self.assertRaises(ValidationError):
             Scene([Patch(direction=(0.0, 0.0), radiance=1.0, weight=1.0)])
         with self.assertRaises(ValidationError):
             Scene([Patch(direction="up", radiance=1.0, weight=1.0)])
+
+    def test_normal_validation(self):
+        scene = make_scene([1.0, 0.5], [1.0, 2.0])
+        for bad in ((0.0, 0.0, 2.0), (1.0, 0.0), (0.0, 0.0, math.nan),
+                    (0.0, math.inf, 1.0), "up", (1.0, 0.0, 0.0, 0.0)):
+            with self.assertRaises(ValidationError):
+                direct_sum(scene, [1.0, 1.0], normal=bad)
+            with self.assertRaises(ValidationError):
+                estimate(scene, [1.0, 1.0], 2, 2, seed=1, normal=bad)
+        # A negative-z direction is valid; it is back-facing only relative
+        # to the queried normal.
+        back = Scene([Patch(direction=(0.0, 0.0, -1.0), radiance=2.0,
+                           weight=1.0)])
+        self.assertEqual(direct_sum(back, [1.0], normal=(0.0, 0.0, 1.0)), 0.0)
+        self.assertEqual(direct_sum(back, [1.0], normal=(0.0, 0.0, -1.0)), 2.0)
 
     def test_weight_and_radiance_bounds(self):
         with self.assertRaises(ValidationError):
@@ -361,6 +379,155 @@ class TestValidation(unittest.TestCase):
             direct_sum("not a scene", self.f)
         with self.assertRaises(ValidationError):
             Scene([("not", "a", "patch")])
+
+
+class TestSurfaceNormal(unittest.TestCase):
+    def _full_sphere_scene(self):
+        # Directions span both hemispheres (no z >= 0 restriction now).
+        dirs = [
+            (0.0, 0.0, 1.0),
+            (0.6, 0.0, 0.8),
+            (1.0, 0.0, 0.0),
+            (-0.6, 0.0, -0.8),
+            (0.0, 0.0, -1.0),
+        ]
+        L = [1.5, 2.0, 1.0, 3.0, 4.0]
+        f = [0.5, 1.0, 2.0, 1.5, 0.75]
+        return Scene([Patch(direction=d, radiance=l, weight=0.5)
+                      for d, l in zip(dirs, L)]), dirs, L, f
+
+    def test_back_facing_directions_contribute_nothing(self):
+        scene, dirs, L, f = self._full_sphere_scene()
+        normal = (0.0, 0.0, 1.0)
+        # Independent reference with clamped dot products.
+        expected = 0.0
+        for i, d in enumerate(dirs):
+            c = max(dot(d, normal), 0.0)
+            expected += L[i] * f[i] * c * 0.5
+        self.assertEqual(direct_sum(scene, f, normal=normal), expected)
+        # The two negative-z patches are excluded entirely.
+        self.assertEqual(direct_sum(scene, f, normal=normal),
+                         direct_sum(scene, f))  # default normal is +z
+
+    def test_cosine_pdf_moves_with_normal(self):
+        scene, dirs, L, f = self._full_sphere_scene()
+        # Facing -z: only the two negative-z patches may carry cosine mass.
+        down = (0.0, 0.0, -1.0)
+        pL, pC = proposal_pdfs(scene, normal=down)
+        for i, d in enumerate(dirs):
+            if dot(d, down) <= 0.0:
+                self.assertEqual(pC[i], 0.0)
+            else:
+                self.assertGreater(pC[i], 0.0)
+        # Radiance proposal is normal-independent.
+        pL2, _ = proposal_pdfs(scene, normal=(0.0, 0.0, 1.0))
+        self.assertEqual(pL, pL2)
+        # Probabilities still sum to 1.
+        self.assertTrue(math.isclose(math.fsum(pC), 1.0))
+        self.assertTrue(math.isclose(math.fsum(pL), 1.0))
+
+    def test_cosine_degenerate_when_all_behind(self):
+        scene, dirs, L, f = self._full_sphere_scene()
+        # Normal along +y: every patch lies in the xz plane, so all are
+        # exactly grazing (dot = 0) -> cosine mass is zero.
+        with self.assertRaises(DegenerateProposalError):
+            estimate(scene, f, 0, 4, seed=1, normal=(0.0, 1.0, 0.0))
+
+    def test_expectation_identity_for_arbitrary_normal(self):
+        scene, dirs, L, f = self._full_sphere_scene()
+        normal = (0.0, 1.0, 0.0)  # only horizon/grazing patch visible...
+        # ...pick an oblique normal instead so both strategies are active.
+        normal = (3.0 / 5.0, 0.0, 4.0 / 5.0)
+        cos = [max(dot(d, normal), 0.0) for d in dirs]
+        expected = reference_direct(L, f, cos, [0.5] * len(dirs))
+        for n_r, n_c in ((1, 1), (3, 2), (1, 4)):
+            table = enumerate_contributions(scene, f, n_r, n_c,
+                                            normal=normal)
+            expect = 0.0
+            for i in range(len(scene)):
+                if table.radiance[i] is not None:
+                    expect += n_r * table.pdf_radiance[i] * table.radiance[i]
+                if table.cosine[i] is not None:
+                    expect += n_c * table.pdf_cosine[i] * table.cosine[i]
+            self.assertTrue(math.isclose(expect, expected,
+                                        rel_tol=1e-12, abs_tol=1e-15))
+
+    def test_records_use_the_normal_consistent_pdfs(self):
+        scene, dirs, L, f = self._full_sphere_scene()
+        normal = (3.0 / 5.0, 0.0, 4.0 / 5.0)
+        n_r, n_c = 5, 7
+        res = estimate(scene, f, n_r, n_c, seed=21, normal=normal)
+        self.assertEqual(res.normal, normal)
+        pL, pC = proposal_pdfs(scene, normal=normal)
+        g = [L[i] * f[i] * max(dot(dirs[i], normal), 0.0) * 0.5
+             for i in range(len(dirs))]
+        for rec in res.records:
+            i = rec.patch_index
+            denom = n_r * pL[i] + n_c * pC[i]
+            self.assertTrue(math.isclose(rec.contribution, g[i] / denom,
+                                         rel_tol=1e-15))
+            # A back-facing patch has zero target and zero cosine pdf; the
+            # cosine strategy can never land there.
+            if dot(dirs[i], normal) <= 0.0:
+                self.assertEqual(pC[i], 0.0)
+                self.assertEqual(g[i], 0.0)
+                self.assertNotEqual(rec.strategy, STRATEGY_COSINE)
+
+    def test_rotation_invariance_same_seed(self):
+        # Rotate the whole scene together with the normal; the physics is
+        # unchanged, so pdfs, draw indices and the estimate must agree.
+        scene, dirs, L, f = self._full_sphere_scene()
+        # 90-degree rotation about the y axis: (x, y, z) -> (z, y, -x).
+        R = ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0))
+
+        def rot(v):
+            return (dot(R[0], v), dot(R[1], v), dot(R[2], v))
+
+        normal = (3.0 / 5.0, 0.0, 4.0 / 5.0)
+        rotated = Scene([Patch(direction=rot(d), radiance=l, weight=0.5)
+                         for d, l in zip(dirs, L)])
+        exact_a = direct_sum(scene, f, normal=normal)
+        exact_b = direct_sum(rotated, f, normal=rot(normal))
+        self.assertEqual(exact_a, exact_b)
+        res_a = estimate(scene, f, 8, 8, seed=77, normal=normal)
+        res_b = estimate(rotated, f, 8, 8, seed=77, normal=rot(normal))
+        self.assertEqual(res_a.estimate, res_b.estimate)
+        self.assertEqual(res_a.variance, res_b.variance)
+        self.assertEqual([r.patch_index for r in res_a.records],
+                         [r.patch_index for r in res_b.records])
+        pLa, pCa = proposal_pdfs(scene, normal=normal)
+        pLb, pCb = proposal_pdfs(rotated, normal=rot(normal))
+        self.assertEqual(pLa, pLb)
+        self.assertEqual(pCa, pCb)
+
+    def test_exact_fraction_identity_with_normal(self):
+        # Exact rational check with a non-axis normal (3/5, 0, 4/5).
+        N = (Fraction(3, 5), Fraction(0), Fraction(4, 5))
+        dirs = [
+            (Fraction(1), Fraction(0), Fraction(0)),
+            (Fraction(0), Fraction(0), Fraction(1)),
+            (Fraction(-3, 5), Fraction(0), Fraction(-4, 5)),  # back-facing
+            (Fraction(4, 5), Fraction(0), Fraction(3, 5)),
+        ]
+        L = [Fraction(2), Fraction(1, 2), Fraction(3), Fraction(5, 4)]
+        w = [Fraction(1, 4)] * 4
+        f = [Fraction(1, 3), Fraction(2), Fraction(5, 2), Fraction(1)]
+        cos = [max(sum(dirs[i][k] * N[k] for k in range(3)), Fraction(0))
+               for i in range(4)]
+        g = [L[i] * f[i] * cos[i] * w[i] for i in range(4)]
+        lm = [L[i] * w[i] for i in range(4)]
+        cm = [cos[i] * w[i] for i in range(4)]
+        pL = [m / sum(lm) for m in lm]
+        pC = [m / sum(cm) for m in cm]
+        # Back-facing patch must have zero cosine probability.
+        self.assertEqual(pC[2], Fraction(0))
+        for n_r, n_c in ((1, 1), (3, 2)):
+            denom = [n_r * pL[i] + n_c * pC[i] for i in range(4)]
+            expectation = Fraction(0)
+            for i in range(4):
+                expectation += n_r * pL[i] * g[i] / denom[i]
+                expectation += n_c * pC[i] * g[i] / denom[i]
+            self.assertEqual(expectation, sum(g))
 
 
 if __name__ == "__main__":
