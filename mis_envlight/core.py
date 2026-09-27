@@ -4,11 +4,19 @@ Estimates the hemispheric sum
 
     S = sum_i  L_i * f_i * cos_i * w_i
 
-over a scene of at most ``MAX_PATCHES`` discrete patches, using multiple
+over a scene of at most ``MAX_PATCHES`` discrete patches on the unit sphere,
+using multiple
 importance sampling (balance heuristic) with two proposal distributions:
 
   * radiance strategy: p_i proportional to L_i * w_i
   * cosine strategy:   q_i proportional to cos_i * w_i
+
+The receiving surface orientation is given by ``Scene(patches, normal)``:
+``cos_i = max(direction_i . normal, 0)``. Patches on the back hemisphere
+(``direction_i . normal < 0``) have zero target value and zero cosine
+proposal probability; they are never given a positive front-side
+contribution. Rotating every patch direction together with the normal leaves
+all cosines, proposal probabilities and estimator values unchanged.
 
 Under the scene contract the patches have equal solid angle, so including
 ``w_i`` does not change the normalized proposals; it is kept so that
@@ -42,6 +50,7 @@ __all__ = [
     "DIAG_UNREACHABLE_TERM",
     "DIAG_VARIANCE_NOT_ESTIMABLE",
     "DIAG_UNUSED_ZERO_MASS_STRATEGY",
+    "DIAG_BACK_FACING_PATCH",
     "MisEnvLightError",
     "ValidationError",
     "DegenerateProposalError",
@@ -71,6 +80,7 @@ DIAG_ZERO_PDF_TERM = "ZERO_PDF_TERM"
 DIAG_UNREACHABLE_TERM = "UNREACHABLE_TERM"
 DIAG_VARIANCE_NOT_ESTIMABLE = "VARIANCE_NOT_ESTIMABLE"
 DIAG_UNUSED_ZERO_MASS_STRATEGY = "UNUSED_ZERO_MASS_STRATEGY"
+DIAG_BACK_FACING_PATCH = "BACK_FACING_PATCH"
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +131,7 @@ def _check_count(name, value):
     return value
 
 
-def _check_direction(name, value):
+def _check_direction(name, value, *, require_upper_hemisphere=False):
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise ValidationError(
             f"{name}: expected a sequence of 3 numbers, got {type(value).__name__}")
@@ -135,7 +145,7 @@ def _check_direction(name, value):
         raise ValidationError(
             f"{name}: expected a unit vector, |v| = {norm!r} "
             f"(tolerance {NORM_TOLERANCE})")
-    if z < 0.0:
+    if require_upper_hemisphere and z < 0.0:
         raise ValidationError(
             f"{name}: z must be >= 0 (upper hemisphere), got {z!r}")
     return (x, y, z)
@@ -149,7 +159,7 @@ def _check_direction(name, value):
 class Patch:
     """One hemispheric patch.
 
-    direction: unit 3-vector (x, y, z) with z >= 0 (upper hemisphere).
+    direction: unit 3-vector (x, y, z) anywhere on the unit sphere.
     radiance:  finite, >= 0.
     weight:    finite, > 0 (solid-angle weight of the patch).
     """
@@ -159,12 +169,18 @@ class Patch:
 
 
 class Scene:
-    """Validated, immutable set of 1..MAX_PATCHES hemispheric patches."""
+    """Validated, immutable set of 1..MAX_PATCHES environment patches.
+
+    normal is the unit surface normal of the receiving surface; the
+    cosine term is max(direction . normal, 0), so patches pointing to the
+    back hemisphere contribute nothing to the front-side integral and
+    receive zero cosine-strategy probability.
+    """
 
     __slots__ = ("directions", "radiance", "weight", "cosine",
-                 "lum_mass", "cos_mass", "lum_total", "cos_total")
+                 "normal", "lum_mass", "cos_mass", "lum_total", "cos_total")
 
-    def __init__(self, patches):
+    def __init__(self, patches, normal=(0.0, 0.0, 1.0)):
         if isinstance(patches, (str, bytes)) or not isinstance(patches, Sequence):
             raise ValidationError(
                 f"patches: expected a sequence of Patch, got {type(patches).__name__}")
@@ -174,7 +190,7 @@ class Scene:
         if len(patches) > MAX_PATCHES:
             raise ValidationError(
                 f"patches: at most {MAX_PATCHES} patches allowed, got {len(patches)}")
-        directions, radiance, weight, cosine = [], [], [], []
+        directions, radiance, weight = [], [], []
         for i, p in enumerate(patches):
             if not isinstance(p, Patch):
                 raise ValidationError(
@@ -186,11 +202,14 @@ class Scene:
             directions.append(d)
             radiance.append(lum)
             weight.append(w)
-            cosine.append(d[2])
+        normal = _check_direction("normal", normal)
+        self.normal = normal
         self.directions = tuple(directions)
         self.radiance = tuple(radiance)
         self.weight = tuple(weight)
-        self.cosine = tuple(cosine)
+        self.cosine = tuple(max(d[0] * normal[0] + d[1] * normal[1]
+                                + d[2] * normal[2], 0.0)
+                            for d in self.directions)
         self.lum_mass = tuple(l * w for l, w in zip(self.radiance, self.weight))
         self.cos_mass = tuple(c * w for c, w in zip(self.cosine, self.weight))
         self.lum_total = math.fsum(self.lum_mass)
@@ -200,7 +219,7 @@ class Scene:
         return len(self.radiance)
 
     def __repr__(self):
-        return f"Scene({len(self)} patches)"
+        return f"Scene({len(self)} patches, normal={self.normal!r})"
 
 
 def _check_scene(scene):
@@ -293,6 +312,21 @@ def _diagnose(scene, g, pdf_radiance, pdf_cosine, n_radiance, n_cosine):
     if n_cosine > 0:
         active.append((STRATEGY_COSINE, pdf_cosine))
     for i in range(len(scene)):
+        raw_cos = (scene.directions[i][0] * scene.normal[0]
+                   + scene.directions[i][1] * scene.normal[1]
+                   + scene.directions[i][2] * scene.normal[2])
+        if raw_cos < 0.0:
+            # Back-facing direction: clamped cosine is zero, so the target
+            # term is zero and the cosine strategy assigns zero probability.
+            # It must never contribute to the front-side integral, even if
+            # the radiance strategy happens to draw it (contribution 0).
+            diags.append(Diagnostic(
+                DIAG_BACK_FACING_PATCH,
+                f"patch {i}: direction . normal = {raw_cos!r} < 0; the patch "
+                f"is on the back hemisphere and contributes zero (cosine "
+                f"clamped to 0)",
+                i))
+            continue
         zero = [name for name, pdf in active if pdf[i] == 0.0]
         if not zero:
             continue

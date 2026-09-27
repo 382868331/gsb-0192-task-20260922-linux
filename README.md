@@ -1,6 +1,7 @@
 # mis_envlight — 离散环境光的多策略重要性估计
 
-离线半球积分器：对至多 64 个离散小片的环境光场景，用多重重要性采样
+离线半球积分器：对至多 64 个离散环境小片（方向可在整个单位球上），
+用多重重要性采样
 （MIS, balance heuristic）估计
 
 ```
@@ -31,12 +32,14 @@ from mis_envlight import (
 ```
 
 - `Patch(direction, radiance, weight)` — 单个小片（frozen dataclass）。
-  - `direction`：单位 3 向量 `(x, y, z)`，`z >= 0`（上半球）；
+  - `direction`：单位 3 向量 `(x, y, z)`，可位于单位球任意位置；
     模长容差 `NORM_TOLERANCE = 1e-9`，不做静默归一化。
   - `radiance`：有限实数，`>= 0`。
   - `weight`：有限实数，`> 0`（立体角权重）。
-- `Scene(patches)` — 1..64 个 `Patch`；构造时全部校验，失败不留下
-  部分构造的对象。`cos_i` 取 `direction` 的 z 分量。
+- `Scene(patches, normal=(0, 0, 1))` — 1..64 个 `Patch` 与接收表面的
+  单位法线 `normal`（默认 +z）；构造时全部校验，失败不留下部分构造
+  的对象。`cos_i = max(direction_i · normal, 0)`：法线背面的小片
+  余弦被夹为 0，既不产生正面贡献，也不进入 cosine 提议分布。
 - `direct_sum(scene, f) -> float` — 精确目标值（`math.fsum` 累加）。
 - `estimate(scene, f, n_radiance, n_cosine, seed) -> EstimateResult` —
   MIS 估计。`f` 为长度等于小片数的有限非负数组（不是回调）；
@@ -54,9 +57,12 @@ balance-heuristic 权重 `mis_weight`、目标项、贡献）、
 
 ## 估计量定义
 
-两提议分布分别为 `p_i ∝ L_i·w_i`（radiance 策略）与
-`q_i ∝ cos_i·w_i`（cosine 策略）。场景契约是等立体角小片，此时与
-"正比于 L / 正比于 cos" 完全等价；保留 `w_i` 使非均匀权重也正确。
+两提议分布分别为 `p_i ∝ L_i·w_i`（radiance 策略，覆盖全球的亮片，
+含背面片，但其目标项为 0，被抽中时贡献恰好为 0）与
+`q_i ∝ max(d_i·n, 0)·w_i`（cosine 策略，只覆盖正面半球）。场景契约
+是等立体角小片，此时与 "正比于 L / 正比于 cos" 完全等价；保留
+`w_i` 使非均匀权重也正确。法线改变时，cosine、`q_i` 的归一化常数与
+MIS 分母一起重新计算，不能只旋转旧结果而沿用旧权重。
 balance heuristic 计入每策略样本数：小片 `i` 处单次抽样的贡献为
 
 ```
@@ -80,7 +86,11 @@ contrib_i = g_i / (n_radiance * p_i + n_cosine * q_i),   g_i = L_i f_i cos_i w_i
 ## 诊断（diagnostics，不中断计算）
 
 - `ZERO_PDF_TERM`：某小片在一个活跃策略下概率为零（如 `L=0` 的暗片、
-  `cos=0` 的掠射片）。目标项为零或另一策略覆盖时无害，仅作提示。
+  相对当前法线 `cos=0` 的掠射片）。目标项为零或另一策略覆盖时无害，
+  仅作提示。
+- `BACK_FACING_PATCH`：某小片方向落在法线背面（`d·n < 0`）。其 cosine
+  被夹为 0，正面目标项为 0，cosine 策略概率为 0；即使 radiance 策略
+  抽中它，贡献也恰好为 0，不会泄漏为正面贡献。
 - `UNREACHABLE_TERM`：目标项非零但所有活跃策略概率均为零——估计量
   有偏。在本契约的合法输入下数学上不可达（`g_i>0` 蕴含 `L_i>0` 且
   `cos_i>0`），作为防御性检查保留并有直接测试。
@@ -100,7 +110,11 @@ contrib_i = g_i / (n_radiance * p_i + n_cosine * q_i),   g_i = L_i f_i cos_i w_i
 
 ## 设计取舍
 
-- 提议分布按 `L·w` / `cos·w` 归一（等立体角下即 "∝L / ∝cos"）。
+- 提议分布按 `L·w` / `max(d·n,0)·w` 归一（等立体角下即
+  "∝L / ∝cos"）；法线改变时 cosine、pdf 与 MIS 分母一并重算。
+- 旋转一致性：对所有小片方向与法线施加同一旋转 R，`cos_i`、两组
+  pdf、抽样序列（同种子）与估计量逐位不变；测试用绕 y 轴 90°
+  旋转验证。
 - `f` 只接受有限数组而非回调：契约可静态校验、可穷举、可复现。
 - 抽样用 `random.Random(seed)` + 累积分布二分，跨运行确定性复现。
 - 方差按策略分层估计：`var = Σ_s n_s · s_s²`（`s_s²` 为该策略样本贡献
@@ -111,7 +125,8 @@ contrib_i = g_i / (n_radiance * p_i + n_cosine * q_i),   g_i = L_i f_i cos_i w_i
 
 ## 已知限制
 
-- 仅上半球（`z >= 0`），`cos` 取方向 z 分量，不支持自定义法线。
+- 方向允许位于整个单位球；是否接收光由 `normal` 决定，背面方向恒为
+  零贡献（不区分双面材质）。
 - `L`、`f` 均要求非负；负值被积函数不在本契约内。
 - 小片数上限 64；无分层/低差异序列等更高级采样；方差在单样本
   策略下不可估计（报 `None`）。

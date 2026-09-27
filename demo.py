@@ -61,17 +61,42 @@ def main():
     print(res.explain(limit=4))
     print()
 
-    print("=== Diagnostics demo: grazing patch (cos = 0) ===")
-    # Patch 1 lies exactly on the horizon: the cosine strategy assigns it
-    # zero probability, which the estimator reports as a diagnostic.
+    print("=== Custom surface normal: grazing and back-facing patches ===")
+    # Surface normal points along +x. Patch 1 (+x) is fully lit, patch 0
+    # (+z) and patch 2 (0.6z,0.8x) are graded, and patch 3 (-x) is on the
+    # back hemisphere: it gets a clamped cosine of 0, zero cosine-strategy
+    # probability and no front-side contribution, even though it is bright.
     gscene = Scene([
         Patch(direction=(0.0, 0.0, 1.0), radiance=1.0, weight=1.0),
         Patch(direction=(1.0, 0.0, 0.0), radiance=2.0, weight=1.0),
-        Patch(direction=(0.0, 0.6, 0.8), radiance=1.0, weight=1.0),
-    ])
-    gres = estimate(gscene, [1.0, 1.0, 1.0], 8, 8, seed=5)
+        Patch(direction=(0.8, 0.0, 0.6), radiance=1.0, weight=1.0),
+        Patch(direction=(-1.0, 0.0, 0.0), radiance=9.0, weight=1.0),
+    ], normal=(1.0, 0.0, 0.0))
+    gres = estimate(gscene, [1.0, 1.0, 1.0, 1.0], 8, 8, seed=5)
+    print(f"cosines = {tuple(round(c, 6) for c in gscene.cosine)}")
+    print(f"exact (bright back patch ignored) = {gres.exact:.6f}")
     for d in gres.diagnostics:
         print(f"  [{d.code}] {d.message}")
+    assert all(rec.contribution == 0.0 for rec in gres.records
+               if rec.patch_index == 3)
+    print()
+
+    print("=== Rotation invariance (rotate directions and normal together) ===")
+    # 90-degree rotation about y: z -> x, x -> -z. Physics is unchanged,
+    # so cosines, PDFs and seeded draws must match exactly.
+    def ry(v):
+        x, y, z = v
+        return (z, y, -x)
+
+    rpatches = [
+        Patch(direction=ry(d), radiance=lum, weight=w)
+        for d, lum, w in zip(gscene.directions, gscene.radiance,
+                             gscene.weight)]
+    rscene = Scene(rpatches, normal=ry(gscene.normal))
+    rres = estimate(rscene, [1.0, 1.0, 1.0, 1.0], 8, 8, seed=5)
+    print(f"cosine tuples equal: {gscene.cosine == rscene.cosine}")
+    print(f"estimates equal:    {gres.estimate == rres.estimate} "
+          f"({gres.estimate:.10f})")
     print()
 
     print("=== Triggered rejection boundaries ===")
